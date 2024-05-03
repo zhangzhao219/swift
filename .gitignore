@@ -133,3 +133,5 @@ output/
 
 # ast template
 ast_index_file.py
+
+pretrained
