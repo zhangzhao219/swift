@@ -7,23 +7,18 @@ import torch
 from peft import PeftModel
 from torch import Tensor, nn
 from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader
 from transformers import Seq2SeqTrainer as HfSeq2SeqTrainer
 from transformers import Trainer as HfTrainer
 from transformers import trainer
+from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.utils import is_peft_available
 
-from swift.torchacc_utils import ta_eval_dataloader, ta_test_dataloader, ta_train_dataloader
+from swift.torchacc_utils import ta_eval_dataloader, ta_test_dataloader, ta_train_dataloader, ta_trim_graph
 from swift.utils import use_torchacc
 from .callback import DefaultFlowCallbackNew, PrinterCallbackNew, ProgressCallbackNew
 from .mixin import PushToMsHubMixin, SwiftMixin
-
-try:
-    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
-except ImportError:
-    from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 
 class Trainer(PushToMsHubMixin, SwiftMixin, HfTrainer):
@@ -33,21 +28,19 @@ class Trainer(PushToMsHubMixin, SwiftMixin, HfTrainer):
 class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
     def __init__(self, *args, **kwargs):
+        self.sequence_parallel_size = kwargs.pop('sequence_parallel_size', 1)
         super().__init__(*args, **kwargs)
         # performance
-        self.perf: Dict[str, Any] = {
+        if not hasattr(self, 'perf'):
+            self.perf = {}
+        self.perf.update({
             'gen_time': 0.,
             'gen_len': 0,
-            'memory': {},
-            'model': self.model.get_trainable_parameters() if hasattr(self.model, 'get_trainable_parameters') else None,
-        }
+        })
         self._acc = torch.tensor(0.).to(self.args.device)
-
-    def train(self, *args, **kwargs) -> torch.Tensor:
-        res = super().train(*args, **kwargs)
-        for i in range(torch.cuda.device_count()):
-            self.perf['memory'][f'cuda:{i}'] = f'{torch.cuda.max_memory_reserved(i)/1024/1024/1024:.2f}GiB'
-        return res
+        if self.sequence_parallel_size > 1:
+            from swift.trainers.xtuner import init_sequence_parallel_xtuner
+            init_sequence_parallel_xtuner(self.sequence_parallel_size)
 
     def prediction_step(
         self,
@@ -91,7 +84,7 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         gen_kwargs['pad_token_id'] = self.tokenizer.pad_token_id
         gen_kwargs['eos_token_id'] = self.tokenizer.eos_token_id
         # fix generate warning
-        if ('max_length' in gen_kwargs and 'max_new_tokens' in gen_kwargs and gen_kwargs['max_new_tokens'] is not None):
+        if 'max_length' in gen_kwargs and 'max_new_tokens' in gen_kwargs and gen_kwargs['max_new_tokens'] is not None:
             gen_kwargs.pop('max_length')
         gen_time = time.time()
         generate_inputs = inputs.copy()
@@ -152,8 +145,8 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
         return loss, generated_tokens, labels
 
-    def compute_scaled_loss(self, labels: torch.Tensor, lm_logits: torch.Tensor,
-                            loss_scale: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def compute_scaled_loss(labels: torch.Tensor, lm_logits: torch.Tensor, loss_scale: torch.Tensor) -> torch.Tensor:
         device = lm_logits.device
         # Shift so that tokens < n predict n
         shift_logits = lm_logits[..., :-1, :]
@@ -205,34 +198,50 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         else:
             loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
 
-        preds = outputs.logits.argmax(dim=2)[..., :-1]
         if labels is None:
             labels = inputs['labels']
-        labels = labels[..., 1:]
+
+        if self.sequence_parallel_size > 1:
+            from swift.trainers.xtuner import reduce_xtuner_sequence_parallel_loss
+            loss = reduce_xtuner_sequence_parallel_loss(loss, labels)
+
+        if self.is_encoder_decoder:
+            preds = outputs.logits.argmax(dim=2)[..., :]
+            labels = labels[..., :]
+        else:
+            preds = outputs.logits.argmax(dim=2)[..., :-1]
+            labels = labels[..., 1:]
+
         masks = labels != -100
         acc_strategy = getattr(self.args, 'acc_strategy', 'token')
         acc: Optional[Tensor] = None
-        if preds.shape != labels.shape:
-            pass
-        elif acc_strategy == 'sentence':
-            acc_list = []
-            for i, m in enumerate(masks):
-                acc_list.append(torch.all(preds[i, m] == labels[i, m]).to(torch.int64).item())
-            acc = torch.tensor(acc_list, device=preds.device).float().mean()
-        else:
-            acc = (torch.masked_select(preds, masks) == torch.masked_select(labels, masks)).float().mean()
-        if model.training and acc is not None:
-            if 'acc' not in self._custom_metrics:
-                self._custom_metrics['acc'] = self._acc
-            self._custom_metrics['acc'] = self._custom_metrics['acc'] + acc / self.args.gradient_accumulation_steps
+
+        if self.state.global_step % self.sft_args.acc_steps == 0:
+            if preds.shape != labels.shape:
+                pass
+            elif acc_strategy == 'sentence':
+                acc_list = []
+                for i, m in enumerate(masks):
+                    acc_list.append(torch.all(preds[i, m] == labels[i, m]).to(torch.int64).item())
+                acc = torch.tensor(acc_list, device=preds.device).float().mean()
+            else:
+                if use_torchacc():
+                    ta_trim_graph()
+                    preds = preds.to('cpu')
+                    masks = masks.to('cpu')
+                    labels = labels.to('cpu')
+                acc = (torch.masked_select(preds, masks) == torch.masked_select(labels, masks)).float().mean()
+            if model.training and acc is not None:
+                if 'acc' not in self._custom_metrics:
+                    self._custom_metrics['acc'] = self._acc
+                self._custom_metrics['acc'] = self._custom_metrics['acc'] + acc / self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
 
     def get_train_dataloader(self):
-
-        if not use_torchacc():
-            return super().get_train_dataloader()
-
-        else:
+        if self.sequence_parallel_size > 1:
+            from swift.trainers.xtuner import get_xtuner_train_dataloader
+            return get_xtuner_train_dataloader(self)
+        elif use_torchacc():
             if trainer.is_datasets_available():
                 import datasets
 
@@ -249,12 +258,13 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
 
             return ta_train_dataloader(train_dataset, data_collator, self._get_train_sampler(), self.args,
                                        self._train_batch_size)
+        else:
+            return super().get_train_dataloader()
 
-    def get_eval_dataloader(self, eval_dataset):
+    def get_eval_dataloader(self, eval_dataset=None):
         if not use_torchacc():
             return super().get_eval_dataloader(eval_dataset)
         else:
-            import torchacc as ta
             if trainer.is_datasets_available():
                 import datasets
 
@@ -274,7 +284,6 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         if not use_torchacc():
             return super().get_test_dataloader(test_dataset)
         else:
-            import torchacc as ta
             if trainer.is_datasets_available():
                 import datasets
 

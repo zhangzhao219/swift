@@ -11,15 +11,20 @@ import gradio as gr
 import json
 import torch
 from gradio import Accordion, Tab
+from json import JSONDecodeError
 
-from swift.llm import SftArguments
+from swift.llm import RLHFArguments
 from swift.ui.base import BaseUI
 from swift.ui.llm_train.advanced import Advanced
 from swift.ui.llm_train.dataset import Dataset
+from swift.ui.llm_train.galore import Galore
 from swift.ui.llm_train.hyper import Hyper
+from swift.ui.llm_train.lisa import Lisa
+from swift.ui.llm_train.llamapro import LlamaPro
 from swift.ui.llm_train.lora import LoRA
 from swift.ui.llm_train.model import Model
 from swift.ui.llm_train.quantization import Quantization
+from swift.ui.llm_train.rlhf import RLHF
 from swift.ui.llm_train.runtime import Runtime
 from swift.ui.llm_train.save import Save
 from swift.ui.llm_train.self_cog import SelfCog
@@ -27,10 +32,18 @@ from swift.utils import get_logger
 
 logger = get_logger()
 
+is_spaces = True if 'SPACE_ID' in os.environ else False
+if is_spaces:
+    is_shared_ui = True if 'modelscope/swift' in os.environ['SPACE_ID'] else False
+else:
+    is_shared_ui = False
+
 
 class LLMTrain(BaseUI):
 
     group = 'llm_train'
+
+    is_studio = os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio'
 
     sub_ui = [
         Model,
@@ -42,6 +55,10 @@ class LLMTrain(BaseUI):
         Quantization,
         SelfCog,
         Advanced,
+        RLHF,
+        Lisa,
+        Galore,
+        LlamaPro,
     ]
 
     locale_dict: Dict[str, Dict] = {
@@ -49,6 +66,16 @@ class LLMTrain(BaseUI):
             'label': {
                 'zh': 'LLM训练',
                 'en': 'LLM Training',
+            }
+        },
+        'train_type': {
+            'label': {
+                'zh': '训练Stage',
+                'en': 'Train Stage'
+            },
+            'info': {
+                'zh': '请注意选择于此匹配的数据集，人类对齐配置在页面下方',
+                'en': 'Please choose matched dataset, RLHF settings is at the bottom of the page'
             }
         },
         'submit_alert': {
@@ -90,16 +117,6 @@ class LLMTrain(BaseUI):
             'info': {
                 'zh': '选择训练使用的GPU号，如CUDA不可用只能选择CPU',
                 'en': 'Select GPU to train'
-            }
-        },
-        'gpu_memory_fraction': {
-            'label': {
-                'zh': 'GPU显存限制',
-                'en': 'GPU memory fraction'
-            },
-            'info': {
-                'zh': '设置使用显存的比例，一般用于显存测试',
-                'en': 'Set the memory fraction ratio of GPU, usually used in memory test'
             }
         },
         'sft_type': {
@@ -152,49 +169,37 @@ class LLMTrain(BaseUI):
                 'en': 'The data parallel size of DDP'
             }
         },
-        'neftune_noise_alpha': {
+        'tuner_backend': {
             'label': {
-                'zh': 'neftune_noise_alpha',
-                'en': 'neftune_noise_alpha'
+                'zh': 'Tuner backend',
+                'en': 'Tuner backend'
             },
             'info': {
-                'zh': '使用neftune提升训练效果, 一般设置为5或者10',
-                'en': 'Use neftune to improve performance, normally the value should be 5 or 10'
+                'zh': 'tuner实现框架，建议peft或者unsloth',
+                'en': 'The tuner backend, suggest to use peft or unsloth'
             }
         },
-        'use_galore': {
+        'sequence_parallel_size': {
             'label': {
-                'zh': '使用GaLore',
-                'en': 'Use GaLore'
+                'zh': '序列并行分段',
+                'en': 'Sequence parallel size'
             },
             'info': {
-                'zh': '使用Galore来减少全参数训练的显存消耗',
-                'en': 'Use Galore to reduce GPU memory usage in full parameter training'
+                'zh': 'DDP条件下的序列并行（减小显存），需要安装ms-swift[seq_parallel]',
+                'en': 'Sequence parallel when ddp, need to install ms-swift[seq_parallel]'
             }
         },
-        'galore_rank': {
+        'train_param': {
             'label': {
-                'zh': 'Galore的秩',
-                'en': 'The rank of Galore'
+                'zh': '训练参数设置',
+                'en': 'Train settings'
             },
         },
-        'galore_update_proj_gap': {
-            'label': {
-                'zh': 'Galore project matrix更新频率',
-                'en': 'The updating gap of the project matrix'
-            },
-        },
-        'galore_optim_per_parameter': {
-            'label': {
-                'zh': '为每个Galore Parameter创建单独的optimizer',
-                'en': 'Create unique optimizer for per Galore parameter'
-            },
-        }
     }
 
-    choice_dict = BaseUI.get_choices_from_dataclass(SftArguments)
-    default_dict = BaseUI.get_default_value_from_dataclass(SftArguments)
-    arguments = BaseUI.get_argument_names(SftArguments)
+    choice_dict = BaseUI.get_choices_from_dataclass(RLHFArguments)
+    default_dict = BaseUI.get_default_value_from_dataclass(RLHFArguments)
+    arguments = BaseUI.get_argument_names(RLHFArguments)
 
     @classmethod
     def do_build_ui(cls, base_tab: Type['BaseUI']):
@@ -207,19 +212,20 @@ class LLMTrain(BaseUI):
             with gr.Blocks():
                 Model.build_ui(base_tab)
                 Dataset.build_ui(base_tab)
+                with gr.Accordion(elem_id='train_param', open=True):
+                    with gr.Row():
+                        gr.Dropdown(
+                            elem_id='train_type', choices=['pretrain/sft', 'rlhf'], value='pretrain/sft', scale=3)
+                        gr.Dropdown(elem_id='sft_type', scale=2)
+                        gr.Dropdown(elem_id='tuner_backend', scale=2)
+                        gr.Textbox(elem_id='sequence_parallel_size', scale=3)
+                    with gr.Row():
+                        gr.Textbox(elem_id='seed', scale=4)
+                        gr.Dropdown(elem_id='dtype', scale=4)
+                        gr.Checkbox(elem_id='use_ddp', value=False, scale=4)
+                        gr.Textbox(elem_id='ddp_num', value='2', scale=4)
+                Hyper.build_ui(base_tab)
                 Runtime.build_ui(base_tab)
-                with gr.Row():
-                    gr.Dropdown(elem_id='sft_type', scale=4)
-                    gr.Textbox(elem_id='seed', scale=4)
-                    gr.Dropdown(elem_id='dtype', scale=4)
-                    gr.Checkbox(elem_id='use_ddp', value=False, scale=4)
-                    gr.Textbox(elem_id='ddp_num', value='2', scale=4)
-                    gr.Slider(elem_id='neftune_noise_alpha', minimum=0.0, maximum=20.0, step=0.5, scale=4)
-                with gr.Row():
-                    gr.Checkbox(elem_id='use_galore', scale=4)
-                    gr.Slider(elem_id='galore_rank', minimum=8, maximum=256, step=8, scale=4)
-                    gr.Slider(elem_id='galore_update_proj_gap', minimum=10, maximum=1000, step=50, scale=4)
-                    gr.Checkbox(elem_id='galore_optim_per_parameter', scale=4)
                 with gr.Row():
                     gr.Dropdown(
                         elem_id='gpu_id',
@@ -227,23 +233,32 @@ class LLMTrain(BaseUI):
                         choices=[str(i) for i in range(gpu_count)] + ['cpu'],
                         value=default_device,
                         scale=8)
-                    gr.Textbox(elem_id='gpu_memory_fraction', scale=4)
-                    gr.Checkbox(elem_id='dry_run', value=False, scale=4)
+                    if is_shared_ui:
+                        gr.Checkbox(elem_id='dry_run', value=True, interactive=False, scale=4)
+                    else:
+                        gr.Checkbox(elem_id='dry_run', value=False, scale=4)
                     submit = gr.Button(elem_id='submit', scale=4, variant='primary')
 
-                Save.build_ui(base_tab)
                 LoRA.build_ui(base_tab)
-                Hyper.build_ui(base_tab)
+                RLHF.build_ui(base_tab)
                 Quantization.build_ui(base_tab)
+                Galore.build_ui(base_tab)
+                Lisa.build_ui(base_tab)
+                LlamaPro.build_ui(base_tab)
                 SelfCog.build_ui(base_tab)
+                Save.build_ui(base_tab)
                 Advanced.build_ui(base_tab)
-                if os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio':
+
+                cls.element('sft_type').change(
+                    Hyper.update_lr, inputs=[base_tab.element('sft_type')], outputs=[cls.element('learning_rate')])
+
+                if cls.is_studio:
                     submit.click(
                         cls.update_runtime, [],
                         [cls.element('runtime_tab'), cls.element('log')]).then(
                             cls.train_studio,
                             [value for value in cls.elements().values() if not isinstance(value, (Tab, Accordion))],
-                            [cls.element('log')],
+                            [cls.element('log')] + Runtime.all_plots + [cls.element('running_cmd')],
                             queue=True)
                 else:
                     submit.click(
@@ -255,17 +270,18 @@ class LLMTrain(BaseUI):
                             cls.element('running_tasks'),
                         ],
                         queue=True)
-                base_tab.element('running_tasks').change(
-                    partial(Runtime.task_changed, base_tab=base_tab), [base_tab.element('running_tasks')],
-                    [value for value in base_tab.elements().values() if not isinstance(value, (Tab, Accordion))]
-                    + [cls.element('log')] + Runtime.all_plots,
-                    cancels=Runtime.log_event)
-                Runtime.element('kill_task').click(
-                    Runtime.kill_task,
-                    [Runtime.element('running_tasks')],
-                    [Runtime.element('running_tasks')] + [Runtime.element('log')] + Runtime.all_plots,
-                    cancels=[Runtime.log_event],
-                ).then(Runtime.reset, [], [Runtime.element('logging_dir')] + [Save.element('output_dir')])
+                if not cls.is_studio:
+                    base_tab.element('running_tasks').change(
+                        partial(Runtime.task_changed, base_tab=base_tab), [base_tab.element('running_tasks')],
+                        [value for value in base_tab.elements().values() if not isinstance(value, (Tab, Accordion))]
+                        + [cls.element('log')] + Runtime.all_plots,
+                        cancels=Runtime.log_event)
+                    Runtime.element('kill_task').click(
+                        Runtime.kill_task,
+                        [Runtime.element('running_tasks')],
+                        [Runtime.element('running_tasks')] + [Runtime.element('log')] + Runtime.all_plots,
+                        cancels=[Runtime.log_event],
+                    ).then(Runtime.reset, [], [Runtime.element('logging_dir')] + [Hyper.element('output_dir')])
 
     @classmethod
     def update_runtime(cls):
@@ -273,34 +289,40 @@ class LLMTrain(BaseUI):
 
     @classmethod
     def train(cls, *args):
-        ignore_elements = ('model_type', 'logging_dir', 'more_params')
-        sft_args = cls.get_default_value_from_dataclass(SftArguments)
+        ignore_elements = ('model_type', 'logging_dir', 'more_params', 'train_type')
+        sft_args = cls.get_default_value_from_dataclass(RLHFArguments)
         kwargs = {}
         kwargs_is_list = {}
         other_kwargs = {}
         more_params = {}
+        more_params_cmd = ''
         keys = [key for key, value in cls.elements().items() if not isinstance(value, (Tab, Accordion))]
         model_type = None
+        do_rlhf = False
         for key, value in zip(keys, args):
             compare_value = sft_args.get(key)
-            compare_value_arg = str(compare_value) if not isinstance(compare_value, (list, dict)) else compare_value
-            compare_value_ui = str(value) if not isinstance(value, (list, dict)) else value
-
             if isinstance(value, str) and re.fullmatch(cls.int_regex, value):
                 value = int(value)
             elif isinstance(value, str) and re.fullmatch(cls.float_regex, value):
                 value = float(value)
-
-            if key not in ignore_elements and key in sft_args and compare_value_ui != compare_value_arg and value:
+            elif isinstance(value, str) and re.fullmatch(cls.bool_regex, value):
+                value = True if value.lower() == 'true' else False
+            if key not in ignore_elements and key in sft_args and compare_value != value and value:
                 kwargs[key] = value if not isinstance(value, list) else ' '.join(value)
                 kwargs_is_list[key] = isinstance(value, list) or getattr(cls.element(key), 'is_list', False)
             else:
                 other_kwargs[key] = value
             if key == 'more_params' and value:
-                more_params = json.loads(value)
+                try:
+                    more_params = json.loads(value)
+                except (JSONDecodeError or TypeError):
+                    more_params_cmd = value
 
             if key == 'model_type':
                 model_type = value
+
+            if key == 'train_type':
+                do_rlhf = value == 'rlhf'
 
         if os.path.exists(kwargs['model_id_or_path']):
             kwargs['model_type'] = model_type
@@ -309,7 +331,10 @@ class LLMTrain(BaseUI):
         if 'dataset' not in kwargs and 'custom_train_dataset_path' not in kwargs:
             raise gr.Error(cls.locale('dataset_alert', cls.lang)['value'])
 
-        sft_args = SftArguments(
+        cmd = 'rlhf' if do_rlhf else 'sft'
+        if kwargs.get('deepspeed'):
+            more_params_cmd += f' --deepspeed {kwargs.pop("deepspeed")} '
+        sft_args = RLHFArguments(
             **{
                 key: value.split(' ') if kwargs_is_list.get(key, False) and isinstance(value, str) else value
                 for key, value in kwargs.items()
@@ -317,12 +342,15 @@ class LLMTrain(BaseUI):
         params = ''
 
         for e in kwargs:
-            if e in kwargs_is_list and kwargs_is_list[e]:
+            if isinstance(kwargs[e], list):
+                params += f'--{e} {" ".join(kwargs[e])} '
+            elif e in kwargs_is_list and kwargs_is_list[e]:
                 params += f'--{e} {kwargs[e]} '
             else:
                 params += f'--{e} "{kwargs[e]}" '
+        params += more_params_cmd + ' '
         params += f'--add_output_dir_suffix False --output_dir {sft_args.output_dir} ' \
-                  f'--logging_dir {sft_args.logging_dir} '
+                  f'--logging_dir {sft_args.logging_dir} --ignore_args_error True'
         ddp_param = ''
         devices = other_kwargs['gpu_id']
         devices = [d for d in devices if d]
@@ -342,24 +370,29 @@ class LLMTrain(BaseUI):
             if ddp_param:
                 ddp_param = f'set {ddp_param} && '
             run_command = f'{cuda_param}{ddp_param}start /b swift sft {params} > {log_file} 2>&1'
-        elif os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio':
-            run_command = f'{cuda_param} {ddp_param} swift sft {params}'
+        elif cls.is_studio:
+            run_command = f'{cuda_param} {ddp_param} swift {cmd} {params}'
         else:
-            run_command = f'{cuda_param} {ddp_param} nohup swift sft {params} > {log_file} 2>&1 &'
+            run_command = f'{cuda_param} {ddp_param} nohup swift {cmd} {params} > {log_file} 2>&1 &'
         logger.info(f'Run training: {run_command}')
         return run_command, sft_args, other_kwargs
 
     @classmethod
     def train_studio(cls, *args):
         run_command, sft_args, other_kwargs = cls.train(*args)
-        if os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio':
+        if not other_kwargs['dry_run']:
             lines = collections.deque(maxlen=int(os.environ.get('MAX_LOG_LINES', 50)))
             process = Popen(run_command, shell=True, stdout=PIPE, stderr=STDOUT)
             with process.stdout:
                 for line in iter(process.stdout.readline, b''):
                     line = line.decode('utf-8')
                     lines.append(line)
-                    yield '\n'.join(lines)
+                    yield ['\n'.join(lines)] + Runtime.plot(run_command) + [run_command]
+        else:
+            yield [
+                'Current is dryrun mode so you can only view the training cmd, please duplicate this space to '
+                'do training or use with inference.'
+            ] + [None] * len(Runtime.sft_plot) + [run_command]
 
     @classmethod
     def train_local(cls, *args):

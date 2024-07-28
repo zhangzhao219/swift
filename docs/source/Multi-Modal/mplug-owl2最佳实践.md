@@ -1,6 +1,6 @@
 
 # mPLUG-Owl2 最佳实践
-以下内容以`mplug-owl2d1-chat`为例, 你也可以选择`mplug-owl2-chat`.
+以下内容以`mplug-owl2_1-chat`为例, 你也可以选择`mplug-owl2-chat`.
 
 ## 目录
 - [环境准备](#环境准备)
@@ -17,17 +17,17 @@ pip install -e '.[llm]'
 ```
 
 模型链接:
-- mplug-owl2d1-chat: [https://modelscope.cn/models/iic/mPLUG-Owl2.1/summary](https://modelscope.cn/models/iic/mPLUG-Owl2.1/summary)
+- mplug-owl2_1-chat: [https://modelscope.cn/models/iic/mPLUG-Owl2.1/summary](https://modelscope.cn/models/iic/mPLUG-Owl2.1/summary)
 - mplug-owl2-chat: [https://modelscope.cn/models/iic/mPLUG-Owl2/summary](https://modelscope.cn/models/iic/mPLUG-Owl2/summary)
 
 
 ## 推理
 
-推理`mplug-owl2d1-chat`:
+推理`mplug-owl2_1-chat`:
 ```shell
 # Experimental environment: A10, 3090, V100...
 # 24GB GPU memory
-CUDA_VISIBLE_DEVICES=0 swift infer --model_type mplug-owl2d1-chat
+CUDA_VISIBLE_DEVICES=0 swift infer --model_type mplug-owl2_1-chat
 ```
 
 输出: (支持传入本地路径或URL)
@@ -48,6 +48,11 @@ The calculation result is 1452 + 45304 = 46756.
 <<< Write a poem based on the content of the picture.
 Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/poem.png
 In the stillness of the night, a boat glides across the water, its light shining bright. The stars twinkle above, casting a magical glow. A man and a dog are on board, enjoying the serene journey. The boat floats gently, as if it's floating on air. The calm waters reflect the stars, creating a breathtaking scene. The man and his dog are lost in their thoughts, taking in the beauty of nature. The boat seems to be floating in a dream, as if they are on a journey to find their way back home.
+--------------------------------------------------
+<<< clear
+<<< Perform OCR on the image.
+Input a media path or URL <<< https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr_en.png
+Text: Swift support training, inference and deployment of 250+ LLMs and 350+ MLMs (multimodal models). Developers can directly apply framework their own research and production environments to realize a complete workflow from model training and evaluation to application. In addition to supporting the lightweight training models provided by PEFT, we also provide a Complete Adapters library that can be adapted to various models such as NeTune, LoRaT, LLMA-PRO, etc. This adapter library can be used directly in your own custom workflow. The library is user-friendly with unfamiliar deep learning, Gradio UI for controlling training and inference, as well as accompanying learning courses and best practices for beginners. Additionally, we provide extra training and Lora LRN for AnimateDiff. Swift has rich documents for users on Huggingface and ModelScope, so please feel free to try it!
 """
 ```
 
@@ -69,6 +74,10 @@ poem:
 
 <img src="http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/poem.png" width="250" style="display: inline-block;">
 
+ocr_en:
+
+<img src="https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr_en.png" width="250" style="display: inline-block;">
+
 **单样本推理**
 
 ```python
@@ -82,7 +91,7 @@ from swift.llm import (
 from swift.utils import seed_everything
 import torch
 
-model_type = ModelType.mplug_owl2d1_chat
+model_type = ModelType.mplug_owl2_1_chat
 template_type = get_default_template_type(model_type)
 print(f'template_type: {template_type}')
 
@@ -134,8 +143,8 @@ road:
 # Experimental environment: A10, 3090, V100...
 # 24GB GPU memory
 CUDA_VISIBLE_DEVICES=0 swift sft \
-    --model_type mplug-owl2d1-chat \
-    --dataset coco-mini-en-2 \
+    --model_type mplug-owl2_1-chat \
+    --dataset coco-en-2-mini \
 ```
 
 [自定义数据集](../LLM/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
@@ -153,17 +162,17 @@ CUDA_VISIBLE_DEVICES=0 swift sft \
 直接推理:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift infer \
-    --ckpt_dir output/mplug-owl2d1-chat/vx-xxx/checkpoint-xxx \
+    --ckpt_dir output/mplug-owl2_1-chat/vx-xxx/checkpoint-xxx \
     --load_dataset_config true \
 ```
 
 **merge-lora**并推理:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift export \
-    --ckpt_dir output/mplug-owl2d1-chat/vx-xxx/checkpoint-xxx \
+    --ckpt_dir output/mplug-owl2_1-chat/vx-xxx/checkpoint-xxx \
     --merge_lora true
 
 CUDA_VISIBLE_DEVICES=0 swift infer \
-    --ckpt_dir output/mplug-owl2d1-chat/vx-xxx/checkpoint-xxx-merged \
+    --ckpt_dir output/mplug-owl2_1-chat/vx-xxx/checkpoint-xxx-merged \
     --load_dataset_config true
 ```

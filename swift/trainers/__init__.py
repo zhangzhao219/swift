@@ -5,18 +5,22 @@ from swift.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
     from .arguments import Seq2SeqTrainingArguments, TrainingArguments
-    from .dpo_trainers import DPOTrainer
+    from .dpo_trainer import DPOTrainer
+    from .orpo_trainer import ORPOTrainer
+    from .rlhf_trainers import RLHFTrainerFactory
     from .trainers import Seq2SeqTrainer, Trainer
-    from .utils import EvaluationStrategy, FSDPOption, HPSearchBackend, HubStrategy, \
-        IntervalStrategy, SchedulerType, ShardedDDPOption, TrainerCallback
+    from .utils import (EvaluationStrategy, FSDPOption, HPSearchBackend, HubStrategy, IntervalStrategy, SchedulerType,
+                        ShardedDDPOption, TrainerCallback, build_tokenized_answer, concat_template)
 else:
     _import_structure = {
         'arguments': ['Seq2SeqTrainingArguments', 'TrainingArguments'],
-        'dpo_trainers': ['DPOTrainer'],
+        'dpo_trainer': ['DPOTrainer'],
+        'orpo_trainer': ['ORPOTrainer'],
+        'rlhf_trainers': ['RLHFTrainerFactory'],
         'trainers': ['Seq2SeqTrainer', 'Trainer'],
         'utils': [
             'EvaluationStrategy', 'FSDPOption', 'HPSearchBackend', 'HubStrategy', 'IntervalStrategy', 'SchedulerType',
-            'ShardedDDPOption', 'TrainerCallback'
+            'ShardedDDPOption', 'TrainerCallback', 'build_tokenized_answer', 'concat_template'
         ]
     }
 

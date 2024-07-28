@@ -30,8 +30,38 @@ pip install -r requirements/llm.txt  -U
 
 ## 数据准备
 
-为训练Agent能力，魔搭官方提供了两个开源数据集：
+swift现支持的agent数据集:
+- [msagent-pro](https://www.modelscope.cn/datasets/iic/MSAgent-Pro)
+- [toolbench](https://www.modelscope.cn/datasets/swift/ToolBench)
+- [ms-agent](https://www.modelscope.cn/datasets/iic/ms_agent)
+- [ms-agent-for-agentfabric](https://www.modelscope.cn/datasets/AI-ModelScope/ms_agent_for_agentfabric)
+- [ms-agent-multirole](https://www.modelscope.cn/datasets/iic/MSAgent-MultiRole)
+- [toolbench-for-alpha-umi](https://www.modelscope.cn/datasets/shenweizhou/alpha-umi-toolbench-processed-v2)
+- [damo-agent-zh](https://www.modelscope.cn/datasets/iic/MSAgent-Bench)
+- [agent-instruct-all-en](https://www.modelscope.cn/datasets/huangjintao/AgentInstruct_copy)
 
+你也可以使用自定义Agent数据集进行训练, 现支持两种格式
+
+格式1
+```jsonl
+{"tools":"{API_LIST}","conversations": [{"from": "system", "value": "00000"}, {"from": "user", "value": "11111"}, {"from": "assistant", "value": "22222"}]}
+{"tools":"{API_LIST}","conversations": [{"from": "user", "value": "aaaaa"}, {"from": "assistant", "value": "bbbbb"}, {"from": "tool", "value": "ccccc"}, {"from": "assistant", "value": "ddddd"}]}
+{"tools":"{API_LIST}","conversations": [{"from": "user", "value": "AAAAA"}, {"from": "assistant", "value": "BBBBB"}, {"from": "tool", "value": "CCCCC"}, {"from": "assistant", "value": "DDDDD"}]}
+```
+
+格式2
+```jsonl
+{"tools":"{API_LIST}","messages": [{"role": "system", "content": "00000"}, {"role": "user", "content": "11111"}, {"role": "assistant", "content": "22222"}]}
+{"tools":"{API_LIST}","messages": [{"role": "user", "content": "aaaaa"}, {"role": "assistant", "content": "bbbbb"}, {"role": "tool", "content": "ccccc"}, {"role": "assistant", "content": "ddddd"}]}
+{"tools":"{API_LIST}","messages": [{"role": "user", "content": "AAAAA"}, {"role": "assistant", "content": "BBBBB"}, {"role": "tool", "content": "CCCCC"}, {"role": "assistant", "content": "DDDDD"}]}
+```
+
+其中tools格式参考[Agent部署文档](./Agent部署最佳实践.md#tools字段), 提供可调用的工具列表, 你可以通过设置`--tools_prompt`来选择对应的prompt
+
+`tool`字段表示工具调用返回结果
+
+
+如果你想保留模型的通用能力, 可以混合一定比例的通用数据集, 以下以混合ms-bench和ms-agent数据集训练agent为例,
 - [魔搭通用问答知识数据集](https://www.modelscope.cn/datasets/iic/ms_bench/summary) 该数据集包含了38万条通用知识多轮对话数据
 - [魔搭通用Agent训练数据集](https://www.modelscope.cn/datasets/iic/ms_agent/summary) 该数据集包含了3万条Agent格式的API调用数据
 
@@ -135,7 +165,7 @@ Final Answer: 如果您想要一款拍照表现出色的手机，我为您推荐
 | ms-bench         | 60000(抽样)     |
 | self-recognition | 3000(重复抽样)  |
 
-我们也支持使用自己的Agent数据集。数据集格式需要符合[自定义数据集](https://github.com/modelscope/swift/blob/main/docs/source/LLM/%E8%87%AA%E5%AE%9A%E4%B9%89%E4%B8%8E%E6%8B%93%E5%B1%95.md#%E8%87%AA%E5%AE%9A%E4%B9%89%E6%95%B0%E6%8D%AE%E9%9B%86)的要求。更具体地，Agent的response/system应该符合上述的Action/Action Input/Observation格式。
+我们也支持使用自己的Agent数据集。数据集格式需要符合[自定义数据集](%E8%87%AA%E5%AE%9A%E4%B9%89%E4%B8%8E%E6%8B%93%E5%B1%95.md#%E8%87%AA%E5%AE%9A%E4%B9%89%E6%95%B0%E6%8D%AE%E9%9B%86)的要求。更具体地，Agent的response/system应该符合上述的Action/Action Input/Observation格式。
 
 我们将**MLP**和**Embedder**加入了lora_target_modules. 你可以通过指定`--lora_target_modules ALL`在所有的linear层(包括qkvo以及mlp和embedder)加lora. 这**通常是效果最好的**.
 

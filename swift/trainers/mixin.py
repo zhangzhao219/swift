@@ -1,9 +1,9 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 # Part of the implementation is borrowed from huggingface/transformers.
-import importlib
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -19,17 +19,19 @@ from peft import PeftModel
 from torch.nn import Module
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from transformers.data.data_collator import DataCollator
+from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
-from transformers.trainer import ADAPTER_CONFIG_NAME  # noqa
-from transformers.trainer import (ADAPTER_SAFE_WEIGHTS_NAME, ADAPTER_WEIGHTS_NAME, CONFIG_NAME, PREFIX_CHECKPOINT_DIR,
-                                  SAFE_WEIGHTS_NAME, TRAINER_STATE_NAME, TRAINING_ARGS_NAME, WEIGHTS_NAME,
-                                  IntervalStrategy, Trainer, TrainerCallback, is_peft_available)
+from transformers.trainer import (ADAPTER_CONFIG_NAME, ADAPTER_SAFE_WEIGHTS_NAME, ADAPTER_WEIGHTS_NAME, CONFIG_NAME,
+                                  PREFIX_CHECKPOINT_DIR, SAFE_WEIGHTS_NAME, TRAINER_STATE_NAME, TRAINING_ARGS_NAME,
+                                  WEIGHTS_NAME, IntervalStrategy, Trainer, TrainerCallback, is_peft_available)
 from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import TrainingArguments
+from transformers.utils import is_sagemaker_mp_enabled, is_torch_npu_available
 
 from swift.hub import Repository
 from swift.hub.check_model import check_local_model_is_latest
-from swift.torchacc_utils import save_ta_checkpoint, ta_load_optimizer_and_scheduler, ta_save_optimizer_and_scheduler
+from swift.torchacc_utils import (save_ta_ddp_checkpoint, save_ta_fsdp_checkpoint, ta_load_optimizer_and_scheduler,
+                                  ta_save_optimizer_and_scheduler, ta_trim_graph)
 from swift.tuners import SwiftModel
 from swift.utils import check_json_format, create_ms_repo, get_logger, use_torchacc
 from swift.utils.constants import Invoke
@@ -235,6 +237,7 @@ class SwiftMixin:
         use_swift = isinstance(model, SwiftModel)
         if is_quantized and use_swift:
             model._hf_peft_config_loaded = True
+        self.is_encoder_decoder = kwargs.pop('is_encoder_decoder', False)
         # mro
         super().__init__(
             model=model,
@@ -249,16 +252,26 @@ class SwiftMixin:
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             **kwargs)
+        if not self.label_names:
+            self.label_names = ['labels']
         if is_quantized and use_swift:
             model._hf_peft_config_loaded = _hf_peft_config_loaded
 
         if get_function(model.__class__.forward) is not get_function(model.forward):
             self.label_names = find_labels(model)
             self.can_return_loss = can_return_loss(model)
+        self.max_memory = 0.0
+        self.start_time = time.time()
+        self._resume_from_checkpoint = None
+        self._resume_only_model = False
+        # performance
+        self.perf: Dict[str, Any] = {'memory': {}}
+        if hasattr(self.model, 'get_trainable_parameters'):
+            self.perf['model'] = self.model.get_trainable_parameters()
 
     @staticmethod
     def _create_configuration_file(model: Module, output_dir: str) -> None:
-        cfg = getattr(model, 'cfg', {})
+        cfg = getattr(model, 'cfg', None) or {}
         configuration_path = os.path.join(output_dir, 'configuration.json')
         new_cfg = {}
         if os.path.exists(configuration_path):
@@ -290,7 +303,8 @@ class SwiftMixin:
         quantization_bit = sft_args.quantization_bit
         if quantization_bit > 0:
             need_to_save += [
-                'quantization_bit', 'bnb_4bit_comp_dtype', 'bnb_4bit_quant_type', 'bnb_4bit_use_double_quant'
+                'quant_method', 'quantization_bit', 'bnb_4bit_comp_dtype', 'bnb_4bit_quant_type',
+                'bnb_4bit_use_double_quant'
             ]
         adapter_cfg = {}
         for k in need_to_save:
@@ -309,14 +323,21 @@ class SwiftMixin:
         return
 
     def _save_optimizer_and_scheduler(self, output_dir):
-        if not use_torchacc():
+        if not (use_torchacc() and self.sft_args.fsdp_num > 1):
             return super()._save_optimizer_and_scheduler(output_dir)
 
         ta_save_optimizer_and_scheduler(self.optimizer, self.lr_scheduler, output_dir)
 
     def _load_optimizer_and_scheduler(self, checkpoint):
-        if not use_torchacc():
-            return super()._load_optimizer_and_scheduler(checkpoint)
+        if not (use_torchacc() and self.sft_args.fsdp_num > 1):
+            if self._resume_only_model:
+                checkpoint = self._resume_from_checkpoint
+                if checkpoint is not None and (is_sagemaker_mp_enabled() or self.is_fsdp_enabled):
+                    self._load_from_checkpoint(checkpoint, self.model_wrapped)
+                return
+            else:
+                # Check if saved optimizer or scheduler states exist
+                return super()._load_optimizer_and_scheduler(checkpoint)
 
         if checkpoint is None or self.args.save_only_model:
             return
@@ -329,8 +350,10 @@ class SwiftMixin:
             return super()._save_tpu(output_dir)
 
         output_dir = output_dir if output_dir is not None else self.args.output_dir
-        logger.info(f'Saving model checkpoint to {output_dir}')
-        save_ta_checkpoint(self.model, self.tokenizer, self.args, output_dir)
+        if self.sft_args.fsdp_num > 1:
+            save_ta_fsdp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
+        else:
+            save_ta_ddp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Compatible with swift and peft"""
@@ -373,15 +396,17 @@ class SwiftMixin:
                 self.model, output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
         else:
             self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
+        sft_args = getattr(self, 'sft_args', None)
         # tokenizer
-        if self.tokenizer is not None:
+        if self.tokenizer is not None and sft_args is not None and sft_args.sft_type == 'full':
+            if hasattr(self.tokenizer, 'processor'):
+                self.tokenizer.processor.save_pretrained(output_dir)
             self.tokenizer.save_pretrained(output_dir)
         # training_args.bin
         torch.save(self.args, os.path.join(output_dir, 'training_args.bin'))
         # additional files
-        sft_args = getattr(self, 'sft_args', None)
         if sft_args is not None and sft_args.sft_type == 'full':
-            additional_files = getattr(self.args, 'additional_saved_files', []) + ['preprocessor_config.json']
+            additional_files = getattr(self.args, 'additional_saved_files', None) or [] + ['preprocessor_config.json']
             if model_dir is not None:
                 for file in additional_files:
                     src_path = os.path.join(model_dir, file)
@@ -393,11 +418,12 @@ class SwiftMixin:
 
     def _save_checkpoint(self, model, trial, metrics=None):
         self.state.last_model_checkpoint = os.path.join(self.args.output_dir, f'checkpoint-{self.state.global_step}')
-        logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
         if version.parse(transformers.__version__) >= version.parse('4.36') or not self.args.save_only_model:
-            return super()._save_checkpoint(model, trial, metrics)
+            result = super()._save_checkpoint(model, trial, metrics)
         else:
-            return self._save_only_model(model, trial, metrics)
+            result = self._save_only_model(model, trial, metrics)
+        logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
+        return result
 
     def _save_only_model(self, model, trial, metrics=None):
         # Save model checkpoint
@@ -447,11 +473,14 @@ class SwiftMixin:
             model = self.model
         if use_torchacc():
             # Loading checkpoint of TorchAcc has been done in tuner.py when
-            # sft_type if 'full'.
-            model = model._get_underlay_model().module.module
+            # sft_type is 'full'.
+            if self.sft_args.fsdp_num > 1:
+                model = model._get_underlay_model().module.module
             if isinstance(model, PreTrainedModel):
                 return
-        elif not isinstance(model, SwiftModel):
+        elif isinstance(model, SwiftModel) or is_deepspeed_zero3_enabled() and isinstance(model, PreTrainedModel):
+            return
+        else:
             # Avoid throwing exceptions
             return super()._load_from_checkpoint(resume_from_checkpoint, model)
 
@@ -481,6 +510,21 @@ class SwiftMixin:
                 checkpoints_sorted[i], checkpoints_sorted[i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
         return checkpoints_sorted
 
+    def train(self, resume_from_checkpoint: Optional[Union[str, bool]] = None, *args, **kwargs) -> torch.Tensor:
+        sft_args = getattr(self, 'sft_args', None)
+        self._resume_only_model = getattr(sft_args, 'resume_only_model', False)
+        if self._resume_only_model:
+            # Control the behavior of "resume_from_checkpoint" by swift.
+            self._resume_from_checkpoint = resume_from_checkpoint
+            resume_from_checkpoint = None
+        if self._resume_from_checkpoint is not None and not is_sagemaker_mp_enabled() and not self.is_fsdp_enabled:
+            self._load_from_checkpoint(self._resume_from_checkpoint)
+        res = super().train(resume_from_checkpoint, *args, **kwargs)
+        self._resume_from_checkpoint = None
+        if self.max_memory != 0:
+            self.perf['memory']['cuda'] = f'{self.max_memory:.2f}GiB'
+        return res
+
     def _load_best_model(self):
         # Compatible with transformers>=4.35 (deepspeed)
         try:
@@ -502,8 +546,22 @@ class SwiftMixin:
         except ValueError as e:
             logger.warning(e)
 
+    def get_max_cuda_memory(self, device: Optional[Union[torch.device, int]] = None) -> float:
+        if device is None:
+            mems = [torch.cuda.max_memory_reserved(device=device) for device in range(torch.cuda.device_count())]
+        else:
+            mems = [torch.cuda.max_memory_reserved(device=device)]
+        mem = sum([float(mem) / 1024 / 1024 / 1024 for mem in mems])
+        if self.max_memory < mem:
+            self.max_memory = mem
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        return mem
+
     def _maybe_log_save_evaluate(self, tr_loss, *args, **kwargs):
         if self.control.should_log:
+            if use_torchacc():
+                ta_trim_graph()
             self.control.should_log = False
             logs: Dict[str, float] = {}
             metrics_log = {'loss': tr_loss}  # loss first
@@ -516,6 +574,8 @@ class SwiftMixin:
                 if k == 'loss':
                     self._total_loss_scalar += v_scalar
                 logs[k] = round(v_scalar / (self.state.global_step - self._globalstep_last_logged), 8)
+                if k == 'acc' and self._globalstep_last_logged > 0:
+                    logs[k] *= self.sft_args.acc_steps
             if version.parse(transformers.__version__) >= version.parse('4.38'):
                 grad_norm = args[0]
                 if isinstance(grad_norm, torch.Tensor):
@@ -523,7 +583,12 @@ class SwiftMixin:
                 if grad_norm is not None:
                     logs['grad_norm'] = grad_norm
             logs['learning_rate'] = self._get_learning_rate()
-
+            if not is_torch_npu_available():
+                logs['memory(GiB)'] = round(self.get_max_cuda_memory(), 2)
+            import time
+            time_now = time.time()
+            elapse_time = time_now - self.start_time
+            logs['train_speed(iter/s)'] = round(self.state.global_step / elapse_time, 6)
             tr_loss -= tr_loss
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()

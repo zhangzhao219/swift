@@ -6,12 +6,14 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Type
 
 import gradio as gr
+import json
 import psutil
 from gradio import Accordion, Tab
 from packaging import version
 
 from swift.ui.base import BaseUI
 from swift.utils import get_logger
+from swift.utils.utils import format_time
 
 logger = get_logger()
 
@@ -20,6 +22,8 @@ class Runtime(BaseUI):
     handlers: Dict[str, Tuple[List, Tuple]] = {}
 
     group = 'llm_infer'
+
+    cmd = 'deploy'
 
     log_event = None
 
@@ -100,15 +104,16 @@ class Runtime(BaseUI):
                     gr.Textbox(elem_id='log', lines=6, visible=False)
 
                 concurrency_limit = {}
-                if version.parse(gr.__version__) >= version.parse('4.0.0'):
+                if version.parse(gr.__version__) >= version.parse('4.0.0') and os.environ.get(
+                        'MODELSCOPE_ENVIRONMENT') != 'studio':
                     concurrency_limit = {'concurrency_limit': 5}
-                cls.log_event = base_tab.element('show_log').click(Runtime.update_log, [], [cls.element('log')]).then(
-                    Runtime.wait, [base_tab.element('running_tasks')], [cls.element('log')], **concurrency_limit)
+                cls.log_event = base_tab.element('show_log').click(cls.update_log, [], [cls.element('log')]).then(
+                    cls.wait, [base_tab.element('running_tasks')], [cls.element('log')], **concurrency_limit)
 
                 base_tab.element('stop_show_log').click(lambda: None, cancels=cls.log_event)
 
                 base_tab.element('refresh_tasks').click(
-                    Runtime.refresh_tasks,
+                    cls.refresh_tasks,
                     [base_tab.element('running_tasks')],
                     [base_tab.element('running_tasks')],
                 )
@@ -154,10 +159,10 @@ class Runtime(BaseUI):
         except IOError:
             pass
 
-    @staticmethod
-    def get_all_ports():
+    @classmethod
+    def get_all_ports(cls):
         process_name = 'swift'
-        cmd_name = 'deploy'
+        cmd_name = cls.cmd
         ports = set()
         for proc in psutil.process_iter():
             try:
@@ -167,18 +172,17 @@ class Runtime(BaseUI):
             if any([process_name in cmdline for cmdline in cmdlines]) and any(  # noqa
                 [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
                 try:
-                    ports.add(
-                        int(Runtime.parse_info_from_cmdline(Runtime.construct_running_task(proc))[1].get('port', 8000)))
+                    ports.add(int(cls.parse_info_from_cmdline(cls.construct_running_task(proc))[1].get('port', 8000)))
                 except IndexError:
                     pass
         return ports
 
-    @staticmethod
-    def refresh_tasks(running_task=None):
+    @classmethod
+    def refresh_tasks(cls, running_task=None):
         log_file = running_task if not running_task or 'pid:' not in running_task else None
         process_name = 'swift'
         negative_name = 'swift.exe'
-        cmd_name = 'deploy'
+        cmd_name = cls.cmd
         process = []
         selected = None
         for proc in psutil.process_iter():
@@ -190,10 +194,10 @@ class Runtime(BaseUI):
                     for cmdline in cmdlines]) and not any([negative_name in cmdline
                                                            for cmdline in cmdlines]) and any(  # noqa
                                                                [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
-                process.append(Runtime.construct_running_task(proc))
+                process.append(cls.construct_running_task(proc))
                 if log_file is not None and any(  # noqa
                     [log_file == cmdline for cmdline in cmdlines]):  # noqa
-                    selected = Runtime.construct_running_task(proc)
+                    selected = cls.construct_running_task(proc)
         if not selected:
             if running_task and running_task in process:
                 selected = running_task
@@ -208,35 +212,18 @@ class Runtime(BaseUI):
         create_time = proc.create_time()
         create_time_formatted = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d, %H:%M')
 
-        def format_time(seconds):
-            days = int(seconds // (24 * 3600))
-            hours = int((seconds % (24 * 3600)) // 3600)
-            minutes = int((seconds % 3600) // 60)
-            seconds = int(seconds % 60)
-
-            if days > 0:
-                time_str = f'{days}d {hours}h {minutes}m {seconds}s'
-            elif hours > 0:
-                time_str = f'{hours}h {minutes}m {seconds}s'
-            elif minutes > 0:
-                time_str = f'{minutes}m {seconds}s'
-            else:
-                time_str = f'{seconds}s'
-
-            return time_str
-
         return f'pid:{pid}/create:{create_time_formatted}' \
                f'/running:{format_time(ts - create_time)}/cmd:{" ".join(proc.cmdline())}'
 
-    @staticmethod
-    def parse_info_from_cmdline(task):
+    @classmethod
+    def parse_info_from_cmdline(cls, task):
         pid = None
         for i in range(3):
             slash = task.find('/')
             if i == 0:
                 pid = task[:slash].split(':')[1]
             task = task[slash + 1:]
-        args = task.split('swift deploy')[1]
+        args = task.split(f'swift {cls.cmd}')[1]
         args = [arg.strip() for arg in args.split('--') if arg.strip()]
         all_args = {}
         for i in range(len(args)):
@@ -245,21 +232,21 @@ class Runtime(BaseUI):
             all_args[splits[0]] = splits[1]
         return pid, all_args
 
-    @staticmethod
-    def kill_task(task):
-        pid, all_args = Runtime.parse_info_from_cmdline(task)
+    @classmethod
+    def kill_task(cls, task):
+        pid, all_args = cls.parse_info_from_cmdline(task)
         log_file = all_args['log_file']
         if sys.platform == 'win32':
             os.system(f'taskkill /f /t /pid "{pid}"')
         else:
             os.system(f'pkill -9 -f {log_file}')
         time.sleep(1)
-        return [Runtime.refresh_tasks()] + [gr.update(value=None)]
+        return [cls.refresh_tasks()] + [gr.update(value=None)]
 
-    @staticmethod
-    def task_changed(task, base_tab):
+    @classmethod
+    def task_changed(cls, task, base_tab):
         if task:
-            _, all_args = Runtime.parse_info_from_cmdline(task)
+            _, all_args = cls.parse_info_from_cmdline(task)
         else:
             all_args = {}
         elements = [value for value in base_tab.elements().values() if not isinstance(value, (Tab, Accordion))]
@@ -285,4 +272,9 @@ class Runtime(BaseUI):
                 ret.append(gr.update(value=arg))
             else:
                 ret.append(gr.update())
-        return ret + [gr.update(value=None), [all_args.get('model_type'), all_args.get('template_type')]]
+        sft_type = None
+        if is_custom_path:
+            with open(os.path.join(all_args['ckpt_dir'], 'sft_args.json'), 'r') as f:
+                _json = json.load(f)
+                sft_type = _json['sft_type']
+        return ret + [gr.update(value=None), [all_args.get('model_type'), all_args.get('template_type'), sft_type]]

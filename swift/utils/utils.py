@@ -12,20 +12,23 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch.distributed as dist
 from transformers import HfArgumentParser, enable_full_determinism, set_seed
+from transformers.trainer import TrainingArguments
 
 from .logger import get_logger
 from .np_utils import stat_array
-from .torch_utils import broadcast_string, is_dist, is_local_master
+from .torch_utils import broadcast_string, is_dist, is_dist_ta, is_local_master
 
 logger = get_logger()
 
 
 @contextmanager
 def safe_ddp_context():
-    if is_dist() and not is_local_master():
+    if (is_dist() or is_dist_ta()) and not is_local_master() and dist.is_initialized():
         dist.barrier()
     yield
-    if is_dist() and is_local_master():
+    if (is_dist() or is_dist_ta()) and is_local_master() and dist.is_initialized():
+        dist.barrier()
+    if (is_dist() or is_dist_ta()) and dist.is_initialized():  # sync
         dist.barrier()
 
 
@@ -40,7 +43,14 @@ def check_json_format(obj: Any) -> Any:
     elif isinstance(obj, Mapping):
         res = {}
         for k, v in obj.items():
-            res[k] = check_json_format(v)
+            if 'hub_token' in k:
+                res[k] = None
+            else:
+                if isinstance(v, TrainingArguments):
+                    for _k in v.__dict__.keys():
+                        if 'hub_token' in _k:
+                            setattr(v, _k, None)
+                res[k] = check_json_format(v)
     else:
         res = repr(obj)  # e.g. function
     return res
@@ -59,6 +69,24 @@ def _get_version(work_dir: str) -> int:
         v = m.group(1)
         v_list.append(int(v))
     return max(v_list) + 1
+
+
+def format_time(seconds):
+    days = int(seconds // (24 * 3600))
+    hours = int((seconds % (24 * 3600)) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+
+    if days > 0:
+        time_str = f'{days}d {hours}h {minutes}m {seconds}s'
+    elif hours > 0:
+        time_str = f'{hours}h {minutes}m {seconds}s'
+    elif minutes > 0:
+        time_str = f'{minutes}m {seconds}s'
+    else:
+        time_str = f'{seconds}s'
+
+    return time_str
 
 
 def seed_everything(seed: Optional[int] = None, full_determinism: bool = False, *, verbose: bool = True) -> int:
@@ -81,8 +109,9 @@ def add_version_to_work_dir(work_dir: str) -> str:
     version = _get_version(work_dir)
     time = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
     sub_folder = f'v{version}-{time}'
-    if dist.is_initialized() and is_dist():
+    if dist.is_initialized() and (is_dist() or is_dist_ta()):
         sub_folder = broadcast_string(sub_folder)
+
     work_dir = os.path.join(work_dir, sub_folder)
     return work_dir
 
@@ -189,6 +218,7 @@ def split_str_parts_by(text: str, delimiters: List[str]):
     Returns:
         The split text in list of dicts.
     """
+    assert isinstance(text, str), f'text: {text}'
     all_start_chars = [d[0] for d in delimiters]
     all_length = [len(d) for d in delimiters]
 
@@ -201,11 +231,10 @@ def split_str_parts_by(text: str, delimiters: List[str]):
             is_delimiter = False
             for index in match_index:
                 if text[char_idx:char_idx + all_length[index]] == delimiters[index]:
-                    if last_words:
-                        if text_list:
-                            text_list[-1]['content'] = last_words
-                        else:
-                            text_list.append({'key': '', 'content': last_words})
+                    if text_list:
+                        text_list[-1]['content'] = last_words
+                    elif last_words:
+                        text_list.append({'key': '', 'content': last_words})
                     last_words = ''
                     text_list.append({'key': delimiters[index]})
                     text = text[char_idx + all_length[index]:]
@@ -218,5 +247,8 @@ def split_str_parts_by(text: str, delimiters: List[str]):
         if last_words == text:
             text = ''
 
-    text_list[-1]['content'] = last_words
+    if len(text_list):
+        text_list[-1]['content'] = last_words
+    else:
+        text_list.append({'key': '', 'content': last_words})
     return text_list

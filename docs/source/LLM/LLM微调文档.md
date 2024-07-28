@@ -3,6 +3,7 @@
 - [环境准备](#环境准备)
 - [微调](#微调)
 - [DPO](#dpo)
+- [ORPO](#orpo)
 - [Merge LoRA](#merge-lora)
 - [量化](#量化)
 - [推理](#推理)
@@ -36,7 +37,7 @@ pip install -r requirements/llm.txt  -U
 ```
 
 ## 微调
-如果你要使用界面的方式进行微调与推理, 可以查看[界面训练与推理文档](https://github.com/modelscope/swift/blob/main/docs/source/GetStarted/%E7%95%8C%E9%9D%A2%E8%AE%AD%E7%BB%83%E6%8E%A8%E7%90%86.md).
+如果你要使用界面的方式进行微调与推理, 可以查看[界面训练与推理文档](../GetStarted/%E7%95%8C%E9%9D%A2%E8%AE%AD%E7%BB%83%E6%8E%A8%E7%90%86.md).
 
 ### 使用python
 ```python
@@ -55,8 +56,7 @@ from swift.llm import (
 model_type = ModelType.qwen_7b_chat
 sft_args = SftArguments(
     model_type=model_type,
-    train_dataset_sample=2000,
-    dataset=[DatasetName.blossom_math_zh],
+    dataset=[f'{DatasetName.blossom_math_zh}#2000'],
     output_dir='output')
 result = sft_main(sft_args)
 best_model_checkpoint = result['best_model_checkpoint']
@@ -65,8 +65,7 @@ torch.cuda.empty_cache()
 
 infer_args = InferArguments(
     ckpt_dir=best_model_checkpoint,
-    load_dataset_config=True,
-    val_dataset_sample=10)
+    load_dataset_config=True)
 # merge_lora(infer_args, device_map='cpu')
 result = infer_main(infer_args)
 torch.cuda.empty_cache()
@@ -80,13 +79,14 @@ app_ui_main(infer_args)
 # 20GB GPU memory
 CUDA_VISIBLE_DEVICES=0 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
-    --dataset blossom-math-zh \
+    --dataset AI-ModelScope/blossom-math-v2 \
     --output_dir output \
 
 # 使用自己的数据集
+# 自定义数据集格式查看: https://github.com/modelscope/swift/blob/main/docs/source/LLM/%E8%87%AA%E5%AE%9A%E4%B9%89%E4%B8%8E%E6%8B%93%E5%B1%95.md#%E8%87%AA%E5%AE%9A%E4%B9%89%E6%95%B0%E6%8D%AE%E9%9B%86
 CUDA_VISIBLE_DEVICES=0 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
-    --custom_train_dataset_path chatml.jsonl \
+    --dataset chatml.jsonl \
     --output_dir output \
 
 # 使用DDP
@@ -96,10 +96,11 @@ CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=2 \
 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
-    --dataset blossom-math-zh \
+    --dataset AI-ModelScope/blossom-math-v2 \
     --output_dir output \
 
 # 多机多卡
+# 如果非共用磁盘请在各机器sh中额外指定`--save_on_each_node true`.
 # node0
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NNODES=2 \
@@ -108,7 +109,7 @@ MASTER_ADDR=127.0.0.1 \
 NPROC_PER_NODE=4 \
 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
-    --dataset blossom-math-zh \
+    --dataset AI-ModelScope/blossom-math-v2 \
     --output_dir output \
 # node1
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -118,7 +119,7 @@ MASTER_ADDR=xxx.xxx.xxx.xxx \
 NPROC_PER_NODE=4 \
 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
-    --dataset blossom-math-zh \
+    --dataset AI-ModelScope/blossom-math-v2 \
     --output_dir output \
 ```
 
@@ -167,7 +168,10 @@ cd examples/pytorch/llm
 
 
 ## DPO
-如果你要使用DPO进行人类对齐, 你可以查看[人类对齐微调文档](LLM人类对齐训练文档.md).
+如果你要使用DPO进行人类对齐, 你可以查看[DPO训练文档](DPO训练文档.md).
+
+## ORPO
+如果你要使用ORPO进行人类对齐, 你可以查看[ORPO最佳实践](ORPO算法最佳实践.md).
 
 ## Merge LoRA
 提示: **暂时**不支持bnb和auto_gptq量化模型的merge lora, 这会产生较大的精度损失.
@@ -189,7 +193,7 @@ CUDA_VISIBLE_DEVICES=0 swift export \
 
 使用**数据集**评估:
 ```bash
-CUDA_VISIBLE_DEVICES=0 swift infer --model_id_or_path qwen/Qwen-7B-Chat --dataset blossom-math-zh
+CUDA_VISIBLE_DEVICES=0 swift infer --model_id_or_path qwen/Qwen-7B-Chat --dataset AI-ModelScope/blossom-math-v2
 ```
 ### 微调后模型
 **单样本推理**:
@@ -243,6 +247,7 @@ print(f'history: {history}')
 
 使用**数据集**评估:
 ```bash
+# 如果要推理所有数据集样本, 请额外指定`--show_dataset_sample -1`
 # 直接推理
 CUDA_VISIBLE_DEVICES=0 swift infer \
     --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx' \

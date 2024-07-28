@@ -1,17 +1,16 @@
 import os
 import typing
 from dataclasses import fields
-from functools import partial, wraps
+from functools import wraps
 from typing import Any, Dict, List, OrderedDict, Type
 
-from gradio import Accordion, Button, Checkbox, Dropdown, Slider, Tab, TabItem, Textbox
+from gradio import Accordion, Audio, Button, Checkbox, Dropdown, File, Image, Slider, Tab, TabItem, Textbox, Video
 
 from swift.llm.utils.model import MODEL_MAPPING, ModelType
 
 all_langs = ['zh', 'en']
 builder: Type['BaseUI'] = None
 base_builder: Type['BaseUI'] = None
-lang = os.environ.get('SWIFT_UI_LANG', all_langs[0])
 
 
 def update_data(fn):
@@ -33,11 +32,14 @@ def update_data(fn):
             self.is_list = kwargs.pop('is_list')
 
         if base_builder and base_builder.default(elem_id) is not None:
-            kwargs['value'] = base_builder.default(elem_id)
+            if os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio' and kwargs.get('value') is not None:
+                pass
+            else:
+                kwargs['value'] = base_builder.default(elem_id)
 
         if builder is not None:
-            if elem_id in builder.locales(lang):
-                values = builder.locale(elem_id, lang)
+            if elem_id in builder.locales(builder.lang):
+                values = builder.locale(elem_id, builder.lang)
                 if 'info' in values:
                     kwargs['info'] = values['info']
                 if 'value' in values:
@@ -48,6 +50,7 @@ def update_data(fn):
                 if argument and 'label' in kwargs:
                     kwargs['label'] = kwargs['label'] + f'({argument})'
 
+        kwargs['elem_classes'] = 'align'
         ret = fn(self, **kwargs)
         self.constructor_args.update(kwargs)
 
@@ -65,6 +68,10 @@ Slider.__init__ = update_data(Slider.__init__)
 TabItem.__init__ = update_data(TabItem.__init__)
 Accordion.__init__ = update_data(Accordion.__init__)
 Button.__init__ = update_data(Button.__init__)
+File.__init__ = update_data(File.__init__)
+Image.__init__ = update_data(Image.__init__)
+Video.__init__ = update_data(Video.__init__)
+Audio.__init__ = update_data(Audio.__init__)
 
 
 class BaseUI:
@@ -79,6 +86,7 @@ class BaseUI:
     lang: str = all_langs[0]
     int_regex = r'^[-+]?[0-9]+$'
     float_regex = r'[-+]?(?:\d*\.*\d+)'
+    bool_regex = r'^(T|t)rue$|^(F|f)alse$'
 
     @classmethod
     def build_ui(cls, base_tab: Type['BaseUI']):

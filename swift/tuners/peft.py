@@ -9,16 +9,17 @@ import json
 import peft
 import torch
 import torch.nn
-from peft import (AdaLoraConfig, IA3Config, LoftQConfig, LoHaConfig, LoKrConfig, LoraModel, OFTConfig, PeftConfig,
-                  PeftModel, PeftModelForCausalLM, PeftModelForSeq2SeqLM, PeftModelForSequenceClassification,
-                  PeftModelForTokenClassification, PrefixTuningConfig, PromptEncoderConfig, PromptLearningConfig,
-                  PromptTuningConfig, get_peft_config, get_peft_model, get_peft_model_state_dict)
+from modelscope import snapshot_download
+from peft import (AdaLoraConfig, BOFTConfig, IA3Config, LoftQConfig, LoHaConfig, LoKrConfig, LoraModel, OFTConfig,
+                  PeftConfig, PeftModel, PeftModelForCausalLM, PeftModelForSeq2SeqLM,
+                  PeftModelForSequenceClassification, PeftModelForTokenClassification, PrefixTuningConfig,
+                  PromptEncoderConfig, PromptLearningConfig, PromptTuningConfig, VeraConfig, get_peft_config,
+                  get_peft_model, get_peft_model_state_dict)
 from peft.config import PeftConfigMixin
 from peft.tuners.lora import Embedding
 from transformers import Trainer
 
 from swift import get_logger
-from swift.hub.snapshot_download import snapshot_download
 
 logger = get_logger()
 dispatchers = []
@@ -26,7 +27,7 @@ dispatchers = []
 
 @dataclass
 class LoraConfig(peft.LoraConfig):
-    lora_dtype: str = field(
+    lora_dtype: Optional[str] = field(
         default=None, metadata={'help': 'The lora dtype, default None means following the original layer\'s dtype'})
 
     lorap_lr_ratio: float = field(default=2.0**4, metadata={'help': 'The lr ratio of lora_B in lora+'})
@@ -268,6 +269,8 @@ def hot_patch_peft_module():
     # Support type conversion
     def init(self, model: torch.nn.Module, config: Dict[str, LoraConfig], adapter_name):
         self.__init_origin__(model, config, adapter_name)
+        if isinstance(self.active_adapter, list):
+            self.active_adapter = self.active_adapter[0]
         active_config = config[self.active_adapter] if isinstance(config, dict) else config
         if hasattr(active_config, 'lora_dtype'):
             for name, module in model.named_modules():
@@ -343,6 +346,9 @@ IA3Config = wrap_module(IA3Config)
 LoHaConfig = wrap_module(LoHaConfig)
 LoKrConfig = wrap_module(LoKrConfig)
 LoftQConfig = wrap_module(LoftQConfig)
+OFTConfig = wrap_module(OFTConfig)
+BOFTConfig = wrap_module(BOFTConfig)
+VeraConfig = wrap_module(VeraConfig)
 OFTConfig = wrap_module(OFTConfig)
 get_peft_config = get_peft_config
 get_peft_model_state_dict = get_peft_model_state_dict

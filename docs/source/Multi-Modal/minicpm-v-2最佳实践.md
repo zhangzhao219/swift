@@ -10,16 +10,19 @@
 
 ## 环境准备
 ```shell
-pip install 'ms-swift[llm]' -U
+# 请使用"ms-swift>=2.2"或者main分支.
+git clone https://github.com/modelscope/swift.git
+cd swift
+pip install -e '.[llm]'
 ```
 
 ## 推理
 
-推理[minicpm-v-2](https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary):
+推理[minicpm-v-v2-chat](https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary):
 ```shell
 # Experimental environment: A10, 3090, V100, ...
 # 10GB GPU memory
-CUDA_VISIBLE_DEVICES=0 swift infer --model_type minicpm-v-v2
+CUDA_VISIBLE_DEVICES=0 swift infer --model_type minicpm-v-v2-chat
 ```
 
 输出: (支持传入本地路径或URL)
@@ -37,12 +40,17 @@ Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.co
 <<< clear
 <<< 计算结果是多少
 Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/math.png
-计算结果是1452 + 4530 = 5982。
+计算结果是1452 + 45304 = 46756。
 --------------------------------------------------
 <<< clear
 <<< 根据图片中的内容写首诗
 Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/poem.png
 这幅图片描绘了一个宁静的夜晚场景，一艘船漂浮在水面之上。船看起来是一艘小木船，船头有一个桅杆，上面挂着一个灯笼，发出温暖的光芒。船身涂成深棕色，与水面形成鲜明对比。水面反射着星星和船只的灯光，营造出一种宁静而梦幻的氛围。背景中，树木繁茂，树叶呈现出金色和绿色，暗示着可能是黄昏或黎明时分。天空布满星星，给整个场景增添了神秘感。整体氛围宁静而幽静，让人联想到一个童话般的场景。
+--------------------------------------------------
+<<< clear
+<<< 对图片进行OCR
+Input a media path or URL <<< https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png
+图片中的文字内容为：“SWIFT支持250+LLM和35+LLM（多模态大模型）的训练、推理和评估部署。开发者可以直接将我们的Research和生产环境中应用的模型框架应用到自己的Research和生产环境中。我们提供了完整的Adapters库以支持最新的训练技术，如NEFtune、Lora、LMA-PRO等，这个适配器库可以脱壳脚本直接在自己的流程中使用。为方便不熟悉深度学习用户的使用，我们提供了配套的深度学习课程和最佳实践新手入门门。此外，我们还在拓展其他强大的能力，目前我们支持了AnimateDiff的全参数LORA训练。SWIFT有丰富的文档体系，如有使用问题请查看这里。”
 """
 ```
 
@@ -64,6 +72,10 @@ poem:
 
 <img src="http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/poem.png" width="250" style="display: inline-block;">
 
+ocr:
+
+<img src="https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png" width="250" style="display: inline-block;">
+
 **单样本推理**
 
 ```python
@@ -77,7 +89,7 @@ from swift.llm import (
 from swift.utils import seed_everything
 import torch
 
-model_type = ModelType.minicpm_v_v2
+model_type = ModelType.minicpm_v_v2_chat
 template_type = get_default_template_type(model_type)
 print(f'template_type: {template_type}')
 
@@ -128,8 +140,8 @@ road:
 # Experimental environment: A10, 3090, V100, ...
 # 10GB GPU memory
 CUDA_VISIBLE_DEVICES=0 swift sft \
-    --model_type minicpm-v-v2 \
-    --dataset coco-mini-en-2 \
+    --model_type minicpm-v-v2-chat \
+    --dataset coco-en-2-mini \
 ```
 
 [自定义数据集](../LLM/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
@@ -147,17 +159,17 @@ CUDA_VISIBLE_DEVICES=0 swift sft \
 直接推理:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift infer \
-    --ckpt_dir output/minicpm-v-v2/vx-xxx/checkpoint-xxx \
+    --ckpt_dir output/minicpm-v-v2-chat/vx-xxx/checkpoint-xxx \
     --load_dataset_config true \
 ```
 
 **merge-lora**并推理:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift export \
-    --ckpt_dir output/minicpm-v-v2/vx-xxx/checkpoint-xxx \
+    --ckpt_dir output/minicpm-v-v2-chat/vx-xxx/checkpoint-xxx \
     --merge_lora true
 
 CUDA_VISIBLE_DEVICES=0 swift infer \
-    --ckpt_dir output/minicpm-v-v2/vx-xxx/checkpoint-xxx-merged \
+    --ckpt_dir output/minicpm-v-v2-chat/vx-xxx/checkpoint-xxx-merged \
     --load_dataset_config true
 ```

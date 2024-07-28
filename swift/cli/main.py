@@ -6,13 +6,17 @@ import sys
 from typing import Dict, List, Optional
 
 ROUTE_MAPPING: Dict[str, str] = {
+    'pt': 'swift.cli.sft',
     'sft': 'swift.cli.sft',
     'infer': 'swift.cli.infer',
     'app-ui': 'swift.cli.app_ui',
     'merge-lora': 'swift.cli.merge_lora',
     'web-ui': 'swift.cli.web_ui',
     'deploy': 'swift.cli.deploy',
-    'dpo': 'swift.cli.dpo',
+    'dpo': 'swift.cli.rlhf',
+    'orpo': 'swift.cli.rlhf',
+    'simpo': 'swift.cli.rlhf',
+    'rlhf': 'swift.cli.rlhf',
     'export': 'swift.cli.export',
     'eval': 'swift.cli.eval'
 }
@@ -44,9 +48,12 @@ def cli_main() -> None:
     argv = sys.argv[1:]
     method_name = argv[0]
     argv = argv[1:]
+    # rlhf compatibility
+    if method_name in ['dpo', 'simpo', 'orpo']:
+        argv = ['--rlhf_type', method_name] + argv
     file_path = importlib.util.find_spec(ROUTE_MAPPING[method_name]).origin
     torchrun_args = get_torchrun_args()
-    if torchrun_args is None or method_name not in ('sft', 'dpo'):
+    if torchrun_args is None or method_name not in ('sft', 'dpo', 'orpo', 'simpo', 'rlhf', 'pt'):
         try:
             python_cmd = 'python'
             subprocess.run(
@@ -60,7 +67,9 @@ def cli_main() -> None:
     else:
         args = ['torchrun', *torchrun_args, file_path, *argv]
     print(f"run sh: `{' '.join(args)}`", flush=True)
-    subprocess.run(args)
+    result = subprocess.run(args)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
 
 if __name__ == '__main__':

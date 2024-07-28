@@ -25,9 +25,10 @@ def ta_accelerate(model,
         config.dist.fsdp.size = fsdp_num
         config.dist.fsdp.wrap_layer_cls = {layer_cls_name}
         config.dist.fsdp.flatten_parameters = fsdp_flatten_parameters
+        config.dist.dp.size = 1
 
         return config
 
     ta_config = get_ta_config()
-    model = ta.accelerate(model, ta_config)
+    model = ta.accelerate(model, config=ta_config)
     return model

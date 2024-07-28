@@ -15,7 +15,7 @@ def clear_session() -> History:
 def gradio_generation_demo(args: AppUIArguments) -> None:
     import gradio as gr
     if args.infer_backend == 'vllm':
-        from swift.llm import prepare_vllm_engine_template, inference_stream_vllm, inference_vllm
+        from swift.llm import prepare_vllm_engine_template, inference_stream_vllm
         llm_engine, template = prepare_vllm_engine_template(args)
     else:
         model, template = prepare_model_template(args)
@@ -44,9 +44,9 @@ def gradio_generation_demo(args: AppUIArguments) -> None:
         send.click(model_generation, inputs=[input_box], outputs=[output_box])
     # Compatible with InferArguments
     share = getattr(args, 'share', False)
-    server_name = getattr(args, 'server_name', '127.0.0.1')
-    server_port = getattr(args, 'server_port', 7860)
-    demo.queue().launch(height=1000, share=share, server_name=server_name, server_port=server_port)
+    host = getattr(args, 'host', '127.0.0.1')
+    port = getattr(args, 'port', 7860)
+    demo.queue().launch(height=1000, share=share, server_name=host, server_port=port)
 
 
 def gradio_chat_demo(args: AppUIArguments) -> None:
@@ -76,17 +76,18 @@ def gradio_chat_demo(args: AppUIArguments) -> None:
         gr.Markdown(f'<center><font size=8>{model_name} Bot</center>')
 
         chatbot = gr.Chatbot(label=f'{model_name}')
-        message = gr.Textbox(lines=2, label='Input')
+        message = gr.Textbox(lines=1, label='Input')
         with gr.Row():
             clear_history = gr.Button('🧹 清除历史对话')
             send = gr.Button('🚀 发送')
+        message.submit(model_chat, inputs=[message, chatbot], outputs=[message, chatbot])
         send.click(model_chat, inputs=[message, chatbot], outputs=[message, chatbot])
         clear_history.click(fn=clear_session, inputs=[], outputs=[chatbot], queue=False)
     # Compatible with InferArguments
     share = getattr(args, 'share', False)
-    server_name = getattr(args, 'server_name', '127.0.0.1')
-    server_port = getattr(args, 'server_port', 7860)
-    demo.queue().launch(height=1000, share=share, server_name=server_name, server_port=server_port)
+    host = getattr(args, 'host', '127.0.0.1')
+    port = getattr(args, 'port', 7860)
+    demo.queue().launch(height=1000, share=share, server_name=host, server_port=port)
 
 
 def llm_app_ui(args: AppUIArguments) -> None:

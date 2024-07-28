@@ -16,6 +16,7 @@ from transformers import is_tensorboard_available
 from swift.ui.base import BaseUI
 from swift.ui.llm_train.utils import close_loop, run_command_in_subprocess
 from swift.utils import TB_COLOR, TB_COLOR_SMOOTH, get_logger, read_tensorboard_file, tensorboard_smoothing
+from swift.utils.utils import format_time
 
 logger = get_logger()
 
@@ -29,6 +30,8 @@ class Runtime(BaseUI):
     all_plots = None
 
     log_event = None
+
+    is_studio = os.environ.get('MODELSCOPE_ENVIRONMENT') == 'studio'
 
     sft_plot = [
         {
@@ -55,28 +58,70 @@ class Runtime(BaseUI):
 
     dpo_plot = [
         {
-            'name': 'loss',
+            'name': 'train/loss',
             'smooth': 0.9,
         },
         {
-            'name': 'learning_rate',
+            'name': 'train/rewards/accuracies',
             'smooth': None,
         },
         {
-            'name': 'rewards/margins',
+            'name': 'train/rewards/margins',
             'smooth': 0.9,
         },
         {
-            'name': 'rewards/chosen',
+            'name': 'train/logps/chosen',
             'smooth': 0.9,
         },
         {
-            'name': 'rewards/rejected',
+            'name': 'train/logps/rejected',
             'smooth': 0.9,
         },
+    ]
+
+    kto_plot = [
         {
-            'name': 'rewards/accuracies',
+            'name': 'kl',
             'smooth': None,
+        },
+        {
+            'name': 'rewards/chosen_sum',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'logps/chosen_sum',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'rewards/rejected_sum',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'logps/rejected_sum',
+            'smooth': 0.9,
+        },
+    ]
+
+    orpo_plot = [
+        {
+            'name': 'train/loss',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/rewards/accuracies',
+            'smooth': None,
+        },
+        {
+            'name': 'train/rewards/margins',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/rewards/chosen',
+            'smooth': 0.9,
+        },
+        {
+            'name': 'train/log_odds_ratio',
+            'smooth': 0.9,
         },
     ]
 
@@ -187,53 +232,84 @@ class Runtime(BaseUI):
             with gr.Blocks():
                 with gr.Row():
                     gr.Textbox(elem_id='running_cmd', lines=1, scale=20, interactive=False, max_lines=1)
-                    gr.Textbox(elem_id='logging_dir', lines=1, scale=20, max_lines=1)
-                    gr.Button(elem_id='show_log', scale=2, variant='primary')
-                    gr.Button(elem_id='stop_show_log', scale=2)
-                    gr.Textbox(elem_id='tb_url', lines=1, scale=10, interactive=False, max_lines=1)
-                    gr.Button(elem_id='start_tb', scale=2, variant='primary')
-                    gr.Button(elem_id='close_tb', scale=2)
+                    if not cls.is_studio:
+                        gr.Textbox(elem_id='logging_dir', lines=1, scale=20, max_lines=1)
+                        gr.Button(elem_id='show_log', scale=2, variant='primary')
+                        gr.Button(elem_id='stop_show_log', scale=2)
+                        gr.Textbox(elem_id='tb_url', lines=1, scale=10, interactive=False, max_lines=1)
+                        gr.Button(elem_id='start_tb', scale=2, variant='primary')
+                        gr.Button(elem_id='close_tb', scale=2)
                 with gr.Row():
                     gr.Textbox(elem_id='log', lines=6, visible=False)
-                with gr.Row():
-                    gr.Dropdown(elem_id='running_tasks', scale=10)
-                    gr.Button(elem_id='refresh_tasks', scale=1)
-                    gr.Button(elem_id='kill_task', scale=1)
+                if not cls.is_studio:
+                    with gr.Row():
+                        gr.Dropdown(elem_id='running_tasks', scale=10)
+                        gr.Button(elem_id='refresh_tasks', scale=1)
+                        gr.Button(elem_id='kill_task', scale=1)
 
                 with gr.Row():
                     cls.all_plots = []
-                    for k in Runtime.sft_plot:
+                    for idx, k in enumerate(Runtime.sft_plot):
                         name = k['name']
-                        cls.all_plots.append(gr.Plot(elem_id=name, label=name))
+                        cls.all_plots.append(gr.Plot(elem_id=str(idx), label=name))
 
-                cls.log_event = base_tab.element('show_log').click(
-                    Runtime.update_log, [], [cls.element('log')] + cls.all_plots).then(
-                        Runtime.wait, [base_tab.element('logging_dir'),
-                                       base_tab.element('running_tasks')], [cls.element('log')] + cls.all_plots)
+                if not cls.is_studio:
+                    cls.log_event = base_tab.element('show_log').click(
+                        Runtime.update_log,
+                        [base_tab.element('running_tasks')], [cls.element('log')] + cls.all_plots).then(
+                            Runtime.wait, [base_tab.element('logging_dir'),
+                                           base_tab.element('running_tasks')], [cls.element('log')] + cls.all_plots)
 
-                base_tab.element('stop_show_log').click(lambda: None, cancels=cls.log_event)
+                    base_tab.element('stop_show_log').click(lambda: None, cancels=cls.log_event)
 
-                base_tab.element('start_tb').click(
-                    Runtime.start_tb,
-                    [base_tab.element('logging_dir')],
-                    [base_tab.element('tb_url')],
-                )
+                    base_tab.element('start_tb').click(
+                        Runtime.start_tb,
+                        [base_tab.element('logging_dir')],
+                        [base_tab.element('tb_url')],
+                    )
 
-                base_tab.element('close_tb').click(
-                    Runtime.close_tb,
-                    [base_tab.element('logging_dir')],
-                    [],
-                )
+                    base_tab.element('close_tb').click(
+                        Runtime.close_tb,
+                        [base_tab.element('logging_dir')],
+                        [],
+                    )
 
-                base_tab.element('refresh_tasks').click(
-                    Runtime.refresh_tasks,
-                    [base_tab.element('running_tasks')],
-                    [base_tab.element('running_tasks')],
-                )
+                    base_tab.element('refresh_tasks').click(
+                        Runtime.refresh_tasks,
+                        [base_tab.element('running_tasks')],
+                        [base_tab.element('running_tasks')],
+                    )
 
     @classmethod
-    def update_log(cls):
-        return [gr.update(visible=True)] * (len(Runtime.sft_plot) + 1)
+    def get_plot(cls, task):
+        if not task or 'swift sft' in task:
+            return cls.sft_plot
+
+        args: dict = cls.parse_info_from_cmdline(task)[1]
+        train_type = args.get('rlhf_type', 'dpo')
+        if train_type in ('dpo', 'cpo', 'simpo'):
+            return cls.dpo_plot
+        elif train_type == 'kto':
+            return cls.kto_plot
+        elif train_type == 'orpo':
+            return cls.orpo_plot
+
+    @classmethod
+    def update_log(cls, task):
+        ret = [gr.update(visible=True)]
+        plot = Runtime.get_plot(task)
+        for i in range(len(plot)):
+            p = plot[i]
+            ret.append(gr.update(visible=True, label=p['name']))
+        return ret
+
+    @classmethod
+    def get_initial(cls, line):
+        tqdm_starts = ['Train:', 'Map:', 'Val:', 'Filter:']
+        for start in tqdm_starts:
+            if line.startswith(start):
+                return start
+        return None
 
     @classmethod
     def wait(cls, logging_dir, task):
@@ -267,6 +343,15 @@ class Runtime(BaseUI):
                     else:
                         latest_data = ''
                     lines.extend(latest_lines)
+                    start = cls.get_initial(lines[-1])
+                    if start:
+                        i = len(lines) - 2
+                        while i >= 0:
+                            if lines[i].startswith(start):
+                                del lines[i]
+                                i -= 1
+                            else:
+                                break
                     yield ['\n'.join(lines)] + Runtime.plot(task)
         except IOError:
             pass
@@ -309,7 +394,7 @@ class Runtime(BaseUI):
         output_dir = running_task if not running_task or 'pid:' not in running_task else None
         process_name = 'swift'
         negative_name = 'swift.exe'
-        cmd_name = 'sft'
+        cmd_name = ['sft', 'rlhf']
         process = []
         selected = None
         for proc in psutil.process_iter():
@@ -320,7 +405,7 @@ class Runtime(BaseUI):
             if any([process_name in cmdline
                     for cmdline in cmdlines]) and not any([negative_name in cmdline
                                                            for cmdline in cmdlines]) and any(  # noqa
-                                                               [cmd_name == cmdline for cmdline in cmdlines]):  # noqa
+                                                               [cmdline in cmd_name for cmdline in cmdlines]):  # noqa
                 process.append(Runtime.construct_running_task(proc))
                 if output_dir is not None and any(  # noqa
                     [output_dir == cmdline for cmdline in cmdlines]):  # noqa
@@ -339,35 +424,22 @@ class Runtime(BaseUI):
         create_time = proc.create_time()
         create_time_formatted = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d, %H:%M')
 
-        def format_time(seconds):
-            days = int(seconds // (24 * 3600))
-            hours = int((seconds % (24 * 3600)) // 3600)
-            minutes = int((seconds % 3600) // 60)
-            seconds = int(seconds % 60)
-
-            if days > 0:
-                time_str = f'{days}d {hours}h {minutes}m {seconds}s'
-            elif hours > 0:
-                time_str = f'{hours}h {minutes}m {seconds}s'
-            elif minutes > 0:
-                time_str = f'{minutes}m {seconds}s'
-            else:
-                time_str = f'{seconds}s'
-
-            return time_str
-
         return f'pid:{pid}/create:{create_time_formatted}' \
                f'/running:{format_time(ts-create_time)}/cmd:{" ".join(proc.cmdline())}'
 
     @staticmethod
     def parse_info_from_cmdline(task):
         pid = None
-        for i in range(3):
-            slash = task.find('/')
-            if i == 0:
-                pid = task[:slash].split(':')[1]
-            task = task[slash + 1:]
-        args = task.split('swift sft')[1]
+        if '/cmd:' in task:
+            for i in range(3):
+                slash = task.find('/')
+                if i == 0:
+                    pid = task[:slash].split(':')[1]
+                task = task[slash + 1:]
+        if 'swift sft' in task:
+            args = task.split('swift sft')[1]
+        elif 'swift rlhf' in task:
+            args = task.split('swift rlhf')[1]
         args = [arg.strip() for arg in args.split('--') if arg.strip()]
         all_args = {}
         for i in range(len(args)):
@@ -380,7 +452,7 @@ class Runtime(BaseUI):
             with open(os.path.join(output_dir, 'sft_args.json'), 'r') as f:
                 _json = json.load(f)
             for key in all_args.keys():
-                all_args[key] = _json[key]
+                all_args[key] = _json.get(key)
                 if isinstance(all_args[key], list):
                     if any([' ' in value for value in all_args[key]]):
                         all_args[key] = [f'"{value}"' for value in all_args[key]]
@@ -396,7 +468,7 @@ class Runtime(BaseUI):
         else:
             os.system(f'pkill -9 -f {output_dir}')
         time.sleep(1)
-        return [Runtime.refresh_tasks()] + [gr.update(value=None)] * (len(Runtime.sft_plot) + 1)
+        return [Runtime.refresh_tasks()] + [gr.update(value=None)] * (len(Runtime.get_plot(task)) + 1)
 
     @staticmethod
     def reset():
@@ -419,14 +491,17 @@ class Runtime(BaseUI):
                 ret.append(gr.update(value=arg))
             else:
                 ret.append(gr.update())
-        return ret + [gr.update(value=None)] * (len(Runtime.sft_plot) + 1)
+        return ret + [gr.update(value=None)] * (len(Runtime.get_plot(task)) + 1)
 
     @staticmethod
     def plot(task):
+        plot = Runtime.get_plot(task)
         if not task:
-            return [None] * len(Runtime.sft_plot)
+            return [None] * len(plot)
         _, all_args = Runtime.parse_info_from_cmdline(task)
         tb_dir = all_args['logging_dir']
+        if not os.path.exists(tb_dir):
+            return [None] * len(plot)
         fname = [
             fname for fname in os.listdir(tb_dir)
             if os.path.isfile(os.path.join(tb_dir, fname)) and fname.startswith('events.out')
@@ -434,12 +509,12 @@ class Runtime(BaseUI):
         if fname:
             fname = fname[0]
         else:
-            return [None] * len(Runtime.sft_plot)
+            return [None] * len(plot)
         tb_path = os.path.join(tb_dir, fname)
         data = read_tensorboard_file(tb_path)
 
         plots = []
-        for k in Runtime.sft_plot:
+        for k in plot:
             name = k['name']
             smooth = k['smooth']
             if name not in data:

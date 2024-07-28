@@ -46,8 +46,8 @@ class Model(BaseUI):
                 'en': 'Model id or path'
             },
             'info': {
-                'zh': '实际的模型id',
-                'en': 'The actual model id or model path'
+                'zh': '实际的模型id，如果是训练后的模型请填入checkpoint-xxx的目录',
+                'en': 'The actual model id or path, if is a trained model, please fill in the checkpoint-xxx dir'
             }
         },
         'template_type': {
@@ -70,14 +70,34 @@ class Model(BaseUI):
                 'en': 'system can be modified after the model weights loaded'
             }
         },
+        'merge_lora': {
+            'label': {
+                'zh': '合并lora',
+                'en': 'merge lora'
+            },
+            'info': {
+                'zh': '仅在sft_type=lora时可用',
+                'en': 'Only available when sft_type=lora'
+            }
+        },
+        'lora_modules': {
+            'label': {
+                'zh': '外部lora模块',
+                'en': 'More lora modules'
+            },
+            'info': {
+                'zh': '空格分割的name=/path1/path2键值对',
+                'en': 'name=/path1/path2 split by blanks'
+            }
+        },
         'more_params': {
             'label': {
                 'zh': '更多参数',
                 'en': 'More params'
             },
             'info': {
-                'zh': '以json格式填入',
-                'en': 'Fill in with json format'
+                'zh': '以json格式或--xxx xxx命令行格式填入',
+                'en': 'Fill in with json format or --xxx xxx cmd format'
             }
         },
         'reset': {
@@ -100,12 +120,14 @@ class Model(BaseUI):
             model_id_or_path = gr.Textbox(elem_id='model_id_or_path', lines=1, scale=20, interactive=True)
             template_type = gr.Dropdown(
                 elem_id='template_type', choices=list(TEMPLATE_MAPPING.keys()) + ['AUTO'], scale=20)
+            gr.Checkbox(elem_id='merge_lora', scale=4)
             reset_btn = gr.Button(elem_id='reset', scale=2)
             model_state = gr.State({})
         with gr.Row():
             system = gr.Textbox(elem_id='system', lines=4, scale=20)
         Generate.build_ui(base_tab)
         with gr.Row():
+            gr.Textbox(elem_id='lora_modules', lines=1, is_list=True, scale=40)
             gr.Textbox(elem_id='more_params', lines=1, scale=20)
             gr.Button(elem_id='load_checkpoint', scale=2, variant='primary')
 

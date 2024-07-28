@@ -1,28 +1,33 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-import os.path
+import asyncio
+import datetime as dt
+import multiprocessing
+import os
 import time
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 
 import json
+from llmuses.config import TaskConfig
+from llmuses.constants import DEFAULT_ROOT_CACHE_DIR
 from llmuses.models.custom import CustomModel
+from llmuses.run import run_task
+from llmuses.summarizer import Summarizer
+from llmuses.utils import EvalBackend
 from modelscope import GenerationConfig
+from openai import APIConnectionError
+from tqdm import tqdm
 
-from swift.utils import get_logger, get_main, seed_everything
-from . import EvalArguments, inference, merge_lora, prepare_model_template
+from swift.utils import append_to_jsonl, get_logger, get_main, seed_everything
+from .infer import merge_lora, prepare_model_template
+from .utils import DeployArguments, EvalArguments, XRequestConfig, inference, inference_client_async
 
 logger = get_logger()
 
 
 class EvalModel(CustomModel):
 
-    def __init__(self, args: EvalArguments, model_name, config={}, **kwargs):
-        if args.eval_url is not None:
-            from openai import OpenAI
-            self.client = OpenAI(
-                api_key=args.eval_token,
-                base_url=args.eval_url,
-            )
-        else:
+    def __init__(self, args: EvalArguments, model_name: str, **kwargs) -> None:
+        if args.eval_url is None:
             if args.merge_lora:
                 merge_lora(args, device_map=args.merge_device_map)
             if args.infer_backend == 'vllm':
@@ -30,148 +35,292 @@ class EvalModel(CustomModel):
                 self.llm_engine, self.template = prepare_vllm_engine_template(args)
             else:
                 self.model, self.template = prepare_model_template(args)
-                if args.overwrite_generation_config:
-                    assert args.ckpt_dir is not None, 'args.ckpt_dir is not specified.'
-                    self.model.generation_config.save_pretrained(args.ckpt_dir)
 
         self.args = args
-        super(EvalModel, self).__init__(config={'model_id': model_name, **config}, **kwargs)
+        super().__init__(config={'model_id': model_name}, **kwargs)
         self.model_name = model_name
-        self.generation_info = {'time': 0, 'tokens': 0}
 
-    def call_openai_chat(self, query: str, history: List, **infer_args):
-        infer_args.pop('best_of', None)
-        history = history or []
-        messages = history
-        messages.append({'role': 'user', 'content': query})
-        resp = self.client.chat.completions.create(model=self.args.model_type, messages=messages, **infer_args)
-        response = resp.choices[0].message.content
-        return response
-
-    def call_openai_base(self, query: str, **infer_args):
-        resp = self.client.completions.create(model=self.args.model_type, prompt=query, **infer_args)
-        response = resp.choices[0].message.content
-        return response
-
-    def predict(self, prompt: str, **kwargs):
-        if self.args.eval_url is not None:
-            assert self.args.eval_is_chat_model is not None
-            infer_cfg = kwargs['infer_cfg']
-            infer_cfg.pop('max_length', None)
-            if 'max_new_tokens' in infer_cfg:
-                infer_cfg['max_tokens'] = infer_cfg.pop('max_new_tokens')
-            if 'do_sample' in infer_cfg:
-                infer_cfg['temperature'] = infer_cfg['temperature'] if infer_cfg['do_sample'] else 0.
-                infer_cfg.pop('do_sample', None)
-            if 'repetition_penalty' in infer_cfg:
-                infer_cfg['presence_penalty'] = infer_cfg.pop('repetition_penalty')
-            if infer_cfg.get('limit') is not None:
-                infer_cfg['n'] = infer_cfg.pop('limit')
-            infer_cfg.pop('limit', None)
-            if 'top_k' in infer_cfg:
-                infer_cfg['best_of'] = infer_cfg.pop('top_k')
-            infer_cfg.pop('top_k', None)
-            infer_cfg.pop('num_beams', None)
-            if self.args.eval_is_chat_model:
-                system = kwargs.get('system')
-                history = kwargs.get('history') or []
-                if system:
-                    history.insert(0, {'role': 'system', 'content': 'system'})
-                response = self.call_openai_chat(prompt, history, **infer_cfg)
-            else:
-                response = self.call_openai_base(prompt, **infer_cfg)
-        elif self.args.infer_backend == 'vllm':
-            from . import inference_vllm
-            request_list = [{'query': prompt, 'history': kwargs.get('history'), 'system': kwargs.get('system')}]
-            if 'temperature' in kwargs['infer_cfg']:
-                self.llm_engine.generation_config.temperature = kwargs['infer_cfg']['temperature']
-            if 'max_new_tokens' in kwargs['infer_cfg']:
-                self.llm_engine.generation_config.max_new_tokens = kwargs['infer_cfg']['max_new_tokens']
-            if 'top_k' in kwargs['infer_cfg']:
-                self.llm_engine.generation_config.top_k = kwargs['infer_cfg']['top_k']
-            if 'top_p' in kwargs['infer_cfg']:
-                self.llm_engine.generation_config.top_p = kwargs['infer_cfg']['top_p']
-            if 'repetition_penalty' in kwargs['infer_cfg']:
-                self.llm_engine.generation_config.repetition_penalty = kwargs['infer_cfg']['repetition_penalty']
-            resp_list = inference_vllm(self.llm_engine, self.template, request_list)
-            response = resp_list[0]['response']
-            new_history = resp_list[0]['history']
+    @staticmethod
+    async def _call_openai(model_type: str, query: str, eval_url: str, *, is_chat_model: bool,
+                           request_config: XRequestConfig, prog_bar: tqdm) -> Tuple[str, Optional[int]]:
+        # idx: maintain the order
+        resp = await inference_client_async(
+            model_type, query, is_chat_request=is_chat_model, request_config=request_config, url=eval_url)
+        if is_chat_model:
+            response = resp.choices[0].message.content
         else:
-            generation_info = {}
-            ts = time.time()
-            response, new_history = inference(
-                self.model,
-                self.template,
-                prompt,
-                history=kwargs.get('history'),
-                system=kwargs.get('system'),
-                generation_info=generation_info,
-                generation_config=GenerationConfig(**kwargs['infer_cfg']))
-            self.generation_info['time'] += time.time() - ts
-            self.generation_info['tokens'] += generation_info['num_generated_tokens']
+            response = resp.choices[0].text
+        prog_bar.update()
+        return response
 
-        res_d: dict = {
-            'choices': [{
-                'index': 0,
-                'message': {
-                    'content': response,
-                    'role': 'assistant'
-                }
-            }],
-            'created': int(time.time()),
-            'model': self.model_name,
-            'object': 'chat.completion',
-        }
+    async def call_openai_batched(self, prompts: List[str], request_config: XRequestConfig) -> List[str]:
+        assert self.args.eval_is_chat_model is not None
+        use_tqdm = True if len(prompts) >= 20 else False
+        prog_bar = tqdm(total=len(prompts), dynamic_ncols=True, disable=not use_tqdm)
+        tasks = []
+        for prompt in prompts:
+            tasks.append(
+                self._call_openai(
+                    self.args.model_type,
+                    prompt,
+                    self.args.eval_url,
+                    is_chat_model=self.args.eval_is_chat_model,
+                    request_config=request_config,
+                    prog_bar=prog_bar))
+        response_list: List[Optional[str]] = await asyncio.gather(*tasks)
+        prog_bar.close()
+        return response_list
 
+    def predict(self, prompts: List[str], **kwargs) -> List[Dict[str, Any]]:
+        infer_cfg = kwargs['infer_cfg'].copy()
+        infer_cfg.pop('limit', None)
+        infer_cfg.pop('max_length', None)
+        assert infer_cfg.get('max_new_tokens') is not None, f'infer_cfg: {infer_cfg}'
+        do_sample = infer_cfg.pop('do_sample', None)
+
+        if self.args.eval_url is not None:
+            if do_sample is False:
+                infer_cfg['temperature'] = 0
+            max_new_tokens = infer_cfg.pop('max_new_tokens', None)
+            if max_new_tokens is not None:
+                infer_cfg['max_tokens'] = max_new_tokens
+
+            request_config = XRequestConfig(**infer_cfg)
+            response_list = asyncio.run(self.call_openai_batched(prompts, request_config))
+
+        elif self.args.infer_backend == 'vllm':
+            from .utils import inference_vllm, VllmGenerationConfig
+            if do_sample is False:
+                infer_cfg['temperature'] = 0
+            generation_config = VllmGenerationConfig(**infer_cfg)
+
+            request_list = [{'query': prompt} for prompt in prompts]
+            use_tqdm = True if len(request_list) >= 20 else False
+            resp_list = inference_vllm(
+                self.llm_engine, self.template, request_list, generation_config=generation_config, use_tqdm=use_tqdm)
+            response_list = [resp['response'] for resp in resp_list]
+        else:
+            if do_sample is False:
+                # fix warning
+                infer_cfg['temperature'] = 1.
+                infer_cfg['top_p'] = 1.
+                infer_cfg['top_k'] = 50
+            if do_sample is not None:
+                infer_cfg['do_sample'] = do_sample
+            response_list = []
+            generation_config = GenerationConfig(**infer_cfg)
+            use_tqdm = True if len(prompts) >= 5 else False
+            prog_bar = tqdm(total=len(prompts), dynamic_ncols=True, disable=not use_tqdm)
+            for prompt in prompts:
+                response, _ = inference(self.model, self.template, prompt, generation_config=generation_config)
+                response_list.append(response)
+                prog_bar.update()
+            prog_bar.close()
+        res_d = []
+        for response in response_list:
+            res_d.append({
+                'choices': [{
+                    'index': 0,
+                    'message': {
+                        'content': response,
+                        'role': 'assistant'
+                    }
+                }],
+                'created': int(time.time()),
+                'model': self.model_name,
+                'object': 'chat.completion',
+            })
         return res_d
 
 
-def run_eval_single_model(args: EvalArguments, model_name, record=None):
-    from llmuses.run import run_task
-    from llmuses.config import TaskConfig
-    from llmuses.summarizer import Summarizer
-    if args.eval_dataset == 'no':
-        args.eval_dataset = []
+def run_custom_model(args: EvalArguments):
+    from swift.llm.deploy import llm_deploy
+    port = args.port
+    args = args.__dict__
+    attrs = dir(DeployArguments)
+    for key in list(args.keys()):
+        if key not in attrs:
+            args.pop(key)
+    deploy_args = DeployArguments(**args)
+    deploy_args.port = port
+    llm_deploy(deploy_args)
 
+
+class EvalDatasetContext:
+
+    def __init__(self):
+        self.cache_dir = self.prepare_evalscope_dataset()
+
+    def __enter__(self):
+        data_dir = os.path.join(self.cache_dir, 'data')
+        local_dir = os.path.join(os.getcwd(), 'data')
+        if os.path.exists(local_dir) and not os.path.islink(local_dir):
+            raise AssertionError('Please promise your pwd dir does not contain a `data` dir.')
+        if os.path.islink(local_dir):
+            os.remove(os.path.join(local_dir))
+        os.symlink(data_dir, local_dir)
+
+    def __exit__(self, *args, **kwargs):
+        pass
+
+    @staticmethod
+    def prepare_evalscope_dataset():
+        from swift.llm.utils.media import MediaCache
+        return MediaCache.download(
+            'https://www.modelscope.cn/api/v1/datasets/swift/evalscope_resource/'
+            'repo?Revision=master&FilePath=eval.zip', 'evalscope')
+
+
+def get_model_type(port, timeout):
+    cnt = 0
+    while True:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key='EMPTY',
+            base_url=f'http://localhost:{port}/v1',
+        )
+        try:
+            return client.models.list().data
+        except APIConnectionError as e:
+            cnt += 1
+            if cnt > timeout:
+                logger.error('Cannot get model_type from the deploy service, please check the error to continue eval')
+                raise e
+            else:
+                time.sleep(1)
+
+
+def eval_opencompass(args: EvalArguments) -> List[Dict[str, Any]]:
+    from llmuses.run import run_task
+    from swift.utils.torch_utils import _find_free_port
+    logger.info(f'args: {args}')
+    if args.eval_few_shot:
+        logger.warn('OpenCompass does not support `eval_few_shot`')
+    process = None
+    if not args.eval_url:
+        seed_everything(args.seed)
+        port = _find_free_port()
+        args.port = port
+        mp = multiprocessing.get_context('spawn')
+        process = mp.Process(target=run_custom_model, args=(args, ))
+        process.start()
+
+        # health check: try to get model_type until raises
+        get_model_type(port, args.deploy_timeout)
+        model_type = 'default-lora' if args.sft_type in ('lora',
+                                                         'longlora') and not args.merge_lora else args.model_type
+        from .deploy import is_generation_template
+        if is_generation_template(args.template_type):
+            url = f'http://127.0.0.1:{port}/v1/completions'
+        else:
+            url = f'http://127.0.0.1:{port}/v1/chat/completions'
+        is_chat = not is_generation_template(args.template_type)
+    else:
+        url = args.eval_url
+        url = url.rstrip('/')
+        if args.eval_is_chat_model:
+            url += '/chat/completions'
+        else:
+            url += '/completions'
+        model_type = args.model_type
+        is_chat = args.eval_is_chat_model
+    eval_limit = args.eval_limit
+    if eval_limit is not None and '[' not in eval_limit:
+        eval_limit = int(eval_limit)
+    limit_config = {'limit': eval_limit} if eval_limit else {}
+    task_cfg = dict(
+        eval_backend='OpenCompass',
+        eval_config={
+            'datasets': args.eval_dataset,
+            'work_dir': args.eval_output_dir,
+            'reuse': 'latest' if args.eval_use_cache else None,
+            'batch_size': args.eval_batch_size,
+            'models': [
+                {
+                    'path': model_type,
+                    'openai_api_base': url,
+                    'is_chat': is_chat,
+                    'key': args.eval_token,
+                },
+            ],
+            **limit_config
+        },
+    )
+
+    with EvalDatasetContext():
+        run_task(task_cfg=task_cfg)
+
+    final_report: List[dict] = Summarizer.get_report_from_cfg(task_cfg=task_cfg)
+    logger.info(f'Final report:{final_report}\n')
+    if process:
+        process.kill()
+    return final_report
+
+
+def eval_llmuses(args: EvalArguments) -> List[Dict[str, Any]]:
+    logger.info(f'args: {args}')
+    seed_everything(args.seed)
+    model_name = args.model_type
+    tm = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    model_name += f'-{args.name or tm}'
     custom_names = []
-    if args.custom_eval_config:
+    if args.custom_eval_config is not None:
         assert os.path.isfile(args.custom_eval_config)
         with open(args.custom_eval_config, 'r') as f:
             custom_eval = json.load(f)
             for _ds in custom_eval:
                 custom_names.append(_ds['name'])
                 TaskConfig.registry(_ds['name'], _ds['pattern'], _ds['dataset'], subset_list=_ds.get('subset_list'))
-    eval_model = EvalModel(args, model_name, config=record or {})
+    eval_model = EvalModel(args, model_name)
 
     task_configs = TaskConfig.load(custom_model=eval_model, tasks=args.eval_dataset + custom_names)
     for task_config in task_configs:
+        task_config.dataset_dir = DEFAULT_ROOT_CACHE_DIR
         task_config.use_cache = args.eval_use_cache
-        if args.eval_limit:
-            task_config.limit = args.eval_limit
-        if args.eval_few_shot is not None:
+        if args.eval_limit is not None:
+            task_config.limit = int(args.eval_limit)
+        eval_few_shot = args.eval_few_shot
+        if 'mmlu' in task_config.datasets:
+            eval_few_shot = 0  # fix
+        if eval_few_shot is not None:
             for dataset in task_config.datasets:
                 if not task_config.dataset_args.get(dataset):
                     task_config.dataset_args[dataset] = {}
-                task_config.dataset_args[dataset]['few_shot_num'] = args.eval_few_shot
-    logger.warn('Eval does not support temperature/top_p/do_sample argument')
-    logger.info(f'Eval task config: {task_configs}')
+                task_config.dataset_args[dataset]['few_shot_num'] = eval_few_shot
+
     run_task(task_cfg=task_configs)
     final_report: List[dict] = Summarizer.get_report_from_cfg(task_cfg=task_configs)
-    final_report = {
-        'report': final_report,
-        'generation_info': eval_model.generation_info,
+    logger.info(f'Final report:{final_report}\n')
+
+    result_dir = os.path.join(args.eval_output_dir, tm)
+    if result_dir is None:
+        result_dir = eval_model.llm_engine.model_dir if args.infer_backend == 'vllm' else eval_model.model.model_dir
+    assert result_dir is not None
+    os.makedirs(result_dir, exist_ok=True)
+    jsonl_path = os.path.join(result_dir, 'eval_result.jsonl')
+    result = {report['name']: report['score'] for report in final_report}
+    logger.info(f'result: {result}')
+    result_info = {
+        'result': result,
+        'model': args.model_type,
+        'time': tm,
     }
-    print(f'Final report:{final_report}\n', flush=True)
+    append_to_jsonl(jsonl_path, result_info)
+    logger.info(f'save_result_path: {jsonl_path}')
     return final_report
 
 
-def llm_eval(args: EvalArguments) -> None:
-    logger.info(f'args: {args}')
-    seed_everything(args.seed)
-    model_name = args.model_type
-    if args.name:
-        model_name += f'-{args.name}'
-    run_eval_single_model(args, model_name)
+def llm_eval(args: EvalArguments) -> List[Dict[str, Any]]:
+    args.eval_output_dir = os.path.join(args.eval_output_dir, args.name or 'default')
+    if args.custom_eval_config:
+        args.eval_backend = EvalBackend.NATIVE.value
+        if args.eval_dataset:
+            logger.warn('--custom_eval_config cannot use together with --eval_dataset')
+            args.eval_dataset = []
+    if args.eval_backend == EvalBackend.OPEN_COMPASS.value:
+        return eval_opencompass(args)
+    else:
+        return eval_llmuses(args)
 
 
 eval_main = get_main(EvalArguments, llm_eval)

@@ -1,5 +1,5 @@
-# MiniCPM-V Best Practices
-Using minicpm-v-3b-chat as an example, if you want to use the updated version of the MiniCPM-V multimodal model (v2), you can switch `--model_type minicpm-v-3b-chat` to `--model_type minicpm-v-v2`.
+# MiniCPM-V Best Practice
+Using minicpm-v-3b-chat as an example, if you want to use the updated version of the MiniCPM-V multimodal model (v2), you can switch `--model_type minicpm-v-3b-chat` to `--model_type minicpm-v-v2-chat`.
 
 ## Table of Contents
 - [Environment Setup](#environment-setup)
@@ -9,12 +9,13 @@ Using minicpm-v-3b-chat as an example, if you want to use the updated version of
 
 ## Environment Setup
 ```shell
+# Please use 'ms-swift>=2.2' or the main branch.
 pip install 'ms-swift[llm]' -U
 ```
 
-Model:
+Model Link:
 - minicpm-v-3b-chat: [https://modelscope.cn/models/OpenBMB/MiniCPM-V/summary](https://modelscope.cn/models/OpenBMB/MiniCPM-V/summary)
-- minicpm-v-v2: [https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary](https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary)
+- minicpm-v-v2-chat: [https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary](https://modelscope.cn/models/OpenBMB/MiniCPM-V-2/summary)
 
 ## Inference
 
@@ -132,10 +133,10 @@ Fine-tuning multimodal large models usually uses **custom datasets**. Here is a 
 # 10GB GPU memory
 CUDA_VISIBLE_DEVICES=0 swift sft \
     --model_type minicpm-v-3b-chat \
-    --dataset coco-mini-en-2 \
+    --dataset coco-en-2-mini \
 ```
 
-[Custom datasets](../LLM/Customization.md#-Recommended-Command-line-arguments)  support json and jsonl formats. Here is an example of a custom dataset:
+[Custom datasets](../LLM/Customization.md#-Recommended-Command-line-arguments) support json and jsonl formats. Here is an example of a custom dataset:
 
 (Supports multi-turn conversations, but the total round of conversations can only contain one image. Supports local path or URL input.)
 

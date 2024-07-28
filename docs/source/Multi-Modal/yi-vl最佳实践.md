@@ -27,9 +27,13 @@ CUDA_VISIBLE_DEVICES=0 swift infer --model_type yi-vl-6b-chat
 输出: (支持传入本地路径或URL)
 ```python
 """
-<<< 描述这种图片
+<<< 描述这张图片
 Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.png
 图片显示一只小猫坐在地板上,眼睛睁开,凝视着摄像机。小猫看起来很可爱,有灰色和白色的毛皮,以及蓝色的眼睛。它似乎正在看摄像机,可能对周围环境很好奇。
+--------------------------------------------------
+<<< 你是谁？
+Input a media path or URL <<<
+我是人工智能助手,随时准备帮助你解答问题或提供信息。
 --------------------------------------------------
 <<< 图中有几只羊
 Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/animal.png
@@ -62,6 +66,11 @@ Input a media path or URL <<< http://modelscope-open.oss-cn-hangzhou.aliyuncs.co
 构成了一个美丽的画面,
 它唤起一种宁静的感觉,
 在喧嚣的城市生活之外。
+--------------------------------------------------
+<<< clear
+<<< 对图片进行OCR
+Input a media path or URL <<< https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png
+这是一段关于SWIFT的文字，其中包括了它的版本、功能以及一些链接。
 """
 ```
 
@@ -82,6 +91,10 @@ math:
 poem:
 
 <img src="http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/poem.png" width="250" style="display: inline-block;">
+
+ocr:
+
+<img src="https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/ocr.png" width="250" style="display: inline-block;">
 
 **单样本推理**
 
@@ -149,12 +162,12 @@ road:
 # 19GB GPU memory
 CUDA_VISIBLE_DEVICES=0 swift sft \
     --model_type yi-vl-6b-chat \
-    --dataset coco-mini-en-2 \
+    --dataset coco-en-2-mini \
 ```
 
 [自定义数据集](../LLM/自定义与拓展.md#-推荐命令行参数的形式)支持json, jsonl样式, 以下是自定义数据集的例子:
 
-(支持多轮对话, 每轮对话必须包含一张图片, 支持传入本地路径或URL)
+(支持多轮对话, 每轮对话须包含一张图片或不含图片, 支持传入本地路径或URL)
 
 ```jsonl
 {"query": "55555", "response": "66666", "images": ["image_path"]}

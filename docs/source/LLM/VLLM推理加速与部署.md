@@ -18,7 +18,7 @@ pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
 pip install 'ms-swift[llm]' -U
 
 # vllm与cuda版本有对应关系，请按照`https://docs.vllm.ai/en/latest/getting_started/installation.html`选择版本
-pip install vllm -U
+pip install vllm
 pip install openai -U
 
 # 环境对齐 (通常不需要运行. 如果你运行错误, 可以跑下面的代码, 仓库使用最新环境测试)
@@ -27,16 +27,16 @@ pip install -r requirements/llm.txt  -U
 ```
 
 ## 推理加速
-vllm不支持bnb量化的模型. vllm支持的模型可以查看[支持的模型](支持的模型和数据集.md#模型).
+vllm支持的模型可以查看[支持的模型](支持的模型和数据集.md#模型).
 
-### qwen-7b-chat
+### 使用python
 ```python
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 from swift.llm import (
     ModelType, get_vllm_engine, get_default_template_type,
-    get_template, inference_vllm
+    get_template, inference_vllm, inference_stream_vllm
 )
 
 model_type = ModelType.qwen_7b_chat
@@ -45,121 +45,102 @@ template_type = get_default_template_type(model_type)
 template = get_template(template_type, llm_engine.hf_tokenizer)
 # 与`transformers.GenerationConfig`类似的接口
 llm_engine.generation_config.max_new_tokens = 256
+generation_info = {}
 
 request_list = [{'query': '你好!'}, {'query': '浙江的省会在哪？'}]
-resp_list = inference_vllm(llm_engine, template, request_list)
+resp_list = inference_vllm(llm_engine, template, request_list, generation_info=generation_info)
 for request, resp in zip(request_list, resp_list):
     print(f"query: {request['query']}")
     print(f"response: {resp['response']}")
+print(generation_info)
 
+# stream
 history1 = resp_list[1]['history']
 request_list = [{'query': '这有什么好吃的', 'history': history1}]
-resp_list = inference_vllm(llm_engine, template, request_list)
-for request, resp in zip(request_list, resp_list):
-    print(f"query: {request['query']}")
-    print(f"response: {resp['response']}")
-    print(f"history: {resp['history']}")
+gen = inference_stream_vllm(llm_engine, template, request_list, generation_info=generation_info)
+query = request_list[0]['query']
+print_idx = 0
+print(f'query: {query}\nresponse: ', end='')
+for resp_list in gen:
+    resp = resp_list[0]
+    response = resp['response']
+    delta = response[print_idx:]
+    print(delta, end='', flush=True)
+    print_idx = len(response)
+print()
+
+history = resp_list[0]['history']
+print(f'history: {history}')
+print(generation_info)
 
 """Out[0]
 query: 你好!
 response: 你好！很高兴为你服务。有什么我可以帮助你的吗？
 query: 浙江的省会在哪？
 response: 浙江省会是杭州市。
+{'num_prompt_tokens': 46, 'num_generated_tokens': 19, 'runtime': 0.22540099400794134, 'samples/s': 8.87307533315286, 'tokens/s': 84.29421566495218}
 query: 这有什么好吃的
 response: 杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。
-history: [('浙江的省会在哪？', '浙江省会是杭州市。'), ('这有什么好吃的', '杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。')]
+history: [['浙江的省会在哪？', '浙江省会是杭州市。'], ['这有什么好吃的', '杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。']]
+{'num_prompt_tokens': 44, 'num_generated_tokens': 46, 'runtime': 0.5646419590048026, 'samples/s': 1.771033810102473, 'tokens/s': 81.46755526471377}
 """
 ```
 
-### 流式输出
+**TP:**
 ```python
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 from swift.llm import (
     ModelType, get_vllm_engine, get_default_template_type,
-    get_template, inference_stream_vllm
+    get_template, inference_vllm, inference_stream_vllm
 )
+if __name__ == '__main__':
+    model_type = ModelType.qwen_7b_chat
+    llm_engine = get_vllm_engine(model_type, tensor_parallel_size=2)
+    template_type = get_default_template_type(model_type)
+    template = get_template(template_type, llm_engine.hf_tokenizer)
+    # 与`transformers.GenerationConfig`类似的接口
+    llm_engine.generation_config.max_new_tokens = 256
+    generation_info = {}
 
-model_type = ModelType.qwen_7b_chat
-llm_engine = get_vllm_engine(model_type)
-template_type = get_default_template_type(model_type)
-template = get_template(template_type, llm_engine.hf_tokenizer)
-# 与`transformers.GenerationConfig`类似的接口
-llm_engine.generation_config.max_new_tokens = 256
+    request_list = [{'query': '你好!'}, {'query': '浙江的省会在哪？'}]
+    resp_list = inference_vllm(llm_engine, template, request_list, generation_info=generation_info)
+    for request, resp in zip(request_list, resp_list):
+        print(f"query: {request['query']}")
+        print(f"response: {resp['response']}")
+    print(generation_info)
 
-request_list = [{'query': '你好!'}, {'query': '浙江的省会在哪？'}]
-gen = inference_stream_vllm(llm_engine, template, request_list)
-query_list = [request['query'] for request in request_list]
-print(f"query_list: {query_list}")
-for resp_list in gen:
-    response_list = [resp['response'] for resp in resp_list]
-    print(f'response_list: {response_list}')
+    # stream
+    history1 = resp_list[1]['history']
+    request_list = [{'query': '这有什么好吃的', 'history': history1}]
+    gen = inference_stream_vllm(llm_engine, template, request_list, generation_info=generation_info)
+    query = request_list[0]['query']
+    print_idx = 0
+    print(f'query: {query}\nresponse: ', end='')
+    for resp_list in gen:
+        resp = resp_list[0]
+        response = resp['response']
+        delta = response[print_idx:]
+        print(delta, end='', flush=True)
+        print_idx = len(response)
+    print()
 
-history1 = resp_list[1]['history']
-request_list = [{'query': '这有什么好吃的', 'history': history1}]
-gen = inference_stream_vllm(llm_engine, template, request_list)
-query = request_list[0]['query']
-print(f"query: {query}")
-for resp_list in gen:
-    response = resp_list[0]['response']
-    print(f'response: {response}')
-
-history = resp_list[0]['history']
-print(f'history: {history}')
-
-"""Out[0]
-query_list: ['你好!', '浙江的省会在哪？']
-...
-response_list: ['你好！很高兴为你服务。有什么我可以帮助你的吗？', '浙江省会是杭州市。']
-query: 这有什么好吃的
-...
-response: 杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。
-history: [('浙江的省会在哪？', '浙江省会是杭州市。'), ('这有什么好吃的', '杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。')]
-"""
-```
-
-### chatglm3
-```python
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
-from swift.llm import (
-    ModelType, get_vllm_engine, get_default_template_type,
-    get_template, inference_vllm
-)
-
-model_type = ModelType.chatglm3_6b
-llm_engine = get_vllm_engine(model_type)
-template_type = get_default_template_type(model_type)
-template = get_template(template_type, llm_engine.hf_tokenizer)
-# 与`transformers.GenerationConfig`类似的接口
-llm_engine.generation_config.max_new_tokens = 256
-
-request_list = [{'query': '你好!'}, {'query': '浙江的省会在哪？'}]
-resp_list = inference_vllm(llm_engine, template, request_list)
-for request, resp in zip(request_list, resp_list):
-    print(f"query: {request['query']}")
-    print(f"response: {resp['response']}")
-
-history1 = resp_list[1]['history']
-request_list = [{'query': '这有什么好吃的', 'history': history1}]
-resp_list = inference_vllm(llm_engine, template, request_list)
-for request, resp in zip(request_list, resp_list):
-    print(f"query: {request['query']}")
-    print(f"response: {resp['response']}")
-    print(f"history: {resp['history']}")
-
+    history = resp_list[0]['history']
+    print(f'history: {history}')
+    print(generation_info)
 """Out[0]
 query: 你好!
-response: 您好，我是人工智能助手。很高兴为您服务！请问有什么问题我可以帮您解答？
+response: 你好！很高兴为你服务。有什么我可以帮助你的吗？
 query: 浙江的省会在哪？
-response: 浙江的省会是杭州。
+response: 浙江省会是杭州市。
+{'num_prompt_tokens': 46, 'num_generated_tokens': 19, 'num_samples': 2, 'runtime': 0.18170836701756343, 'samples/s': 11.006647810591383, 'tokens/s': 104.56315420061814}
 query: 这有什么好吃的
-response: 浙江有很多美食,其中一些非常有名的包括杭州的龙井虾仁、东坡肉、西湖醋鱼、叫化童子鸡等。另外,浙江还有很多特色小吃和糕点,比如宁波的汤团、年糕,温州的炒螃蟹、温州肉圆等。
-history: [('浙江的省会在哪？', '浙江的省会是杭州。'), ('这有什么好吃的', '浙江有很多美食,其中一些非常有名的包括杭州的龙井虾仁、东坡肉、西湖醋鱼、叫化童子鸡等。另外,浙江还有很多特色小吃和糕点,比如宁波的汤团、年糕,温州的炒螃蟹、温州肉圆等。')]
+response: 杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。
+history: [['浙江的省会在哪？', '浙江省会是杭州市。'], ['这有什么好吃的', '杭州是一个美食之城，拥有许多著名的菜肴和小吃，例如西湖醋鱼、东坡肉、叫化童子鸡等。此外，杭州还有许多小吃店，可以品尝到各种各样的本地美食。']]
+{'num_prompt_tokens': 44, 'num_generated_tokens': 46, 'num_samples': 1, 'runtime': 0.47030443901894614, 'samples/s': 2.1262822908624837, 'tokens/s': 97.80898537967424}
 """
 ```
+
 
 ### 使用CLI
 ```bash
@@ -169,6 +150,12 @@ CUDA_VISIBLE_DEVICES=0 swift infer --model_type qwen-7b-chat --infer_backend vll
 CUDA_VISIBLE_DEVICES=0 swift infer --model_type yi-6b-chat --infer_backend vllm
 # gptq
 CUDA_VISIBLE_DEVICES=0 swift infer --model_type qwen1half-7b-chat-int4 --infer_backend vllm
+
+# TP
+# 2 * 80GiB A100
+RAY_memory_monitor_refresh_ms=0 CUDA_VISIBLE_DEVICES=0,1 swift infer \
+    --model_type qwen2-72b-instruct --infer_backend vllm --max_model_len 2048 \
+    --tensor_parallel_size 2
 ```
 
 ### 微调后的模型
@@ -208,6 +195,7 @@ CUDA_VISIBLE_DEVICES=0 swift export \
     --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx' --merge_lora true
 
 # 使用数据集评估
+# 如果要推理所有数据集样本, 请额外指定`--show_dataset_sample -1`
 CUDA_VISIBLE_DEVICES=0 swift infer \
     --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx-merged' \
     --infer_backend vllm \
@@ -267,7 +255,7 @@ curl http://localhost:8000/v1/chat/completions \
 }'
 ```
 
-使用swift:
+使用swift的同步客户端接口:
 ```python
 from swift.llm import get_model_list_client, XRequestConfig, inference_client
 
@@ -301,7 +289,50 @@ response: 杭州有许多美食，例如西湖醋鱼、东坡肉、龙井虾仁�
 """
 ```
 
-使用openai:
+使用swift的异步客户端接口:
+```python
+import asyncio
+from swift.llm import get_model_list_client, XRequestConfig, inference_client_async
+
+model_list = get_model_list_client()
+model_type = model_list.data[0].id
+print(f'model_type: {model_type}')
+
+query = '浙江的省会在哪里?'
+request_config = XRequestConfig(seed=42)
+tasks = [inference_client_async(model_type, query, request_config=request_config) for _ in range(5)]
+async def _batch_run(tasks):
+    return await asyncio.gather(*tasks)
+
+resp_list = asyncio.run(_batch_run(tasks))
+resp = resp_list[0]
+response = resp.choices[0].message.content
+print(f'query: {query}')
+print(f'response: {response}')
+
+async def _stream():
+    global query
+    history = [(query, response)]
+    query = '这有什么好吃的?'
+    request_config = XRequestConfig(stream=True, seed=42)
+    stream_resp = await inference_client_async(model_type, query, history, request_config=request_config)
+    print(f'query: {query}')
+    print('response: ', end='')
+    async for chunk in stream_resp:
+        print(chunk.choices[0].delta.content, end='', flush=True)
+    print()
+
+asyncio.run(_stream())
+"""Out[0]
+model_type: qwen-7b-chat
+query: 浙江的省会在哪里?
+response: 浙江省的省会是杭州市。
+query: 这有什么好吃的?
+response: 浙江省有很多美食，比如杭州菜、宁波菜、绍兴菜、温州菜等。其中，杭州菜以清淡、鲜美、精致著称，而宁波菜则以鲜美、醇厚、香辣著称。此外，浙江省还有许多特色小吃，比如杭州的西湖醋鱼、宁波的汤圆、绍兴的酒酿圆子等。
+"""
+```
+
+使用openai（同步）:
 ```python
 from openai import OpenAI
 client = OpenAI(
@@ -373,7 +404,7 @@ curl http://localhost:8000/v1/completions \
 }'
 ```
 
-使用swift:
+使用swift的同步客户端接口:
 ```python
 from swift.llm import get_model_list_client, XRequestConfig, inference_client
 
@@ -420,7 +451,59 @@ response:  成都
 """
 ```
 
-使用openai:
+使用swift的异步客户端接口:
+```python
+import asyncio
+from swift.llm import get_model_list_client, XRequestConfig, inference_client_async
+
+model_list = get_model_list_client()
+model_type = model_list.data[0].id
+print(f'model_type: {model_type}')
+
+query = '浙江 -> 杭州\n安徽 -> 合肥\n四川 ->'
+request_config = XRequestConfig(max_tokens=32, temperature=0.1, seed=42)
+
+resp = asyncio.run(inference_client_async(model_type, query, request_config=request_config))
+response = resp.choices[0].text
+print(f'query: {query}')
+print(f'response: {response}')
+
+async def _stream():
+    request_config.stream = True
+    stream_resp = await inference_client_async(model_type, query, request_config=request_config)
+    print(f'query: {query}')
+    print('response: ', end='')
+    async for chunk in stream_resp:
+        print(chunk.choices[0].text, end='', flush=True)
+    print()
+
+asyncio.run(_stream())
+"""Out[0]
+model_type: qwen-7b
+query: 浙江 -> 杭州
+安徽 -> 合肥
+四川 ->
+response:  成都
+广东 -> 广州
+江苏 -> 南京
+浙江 -> 杭州
+安徽 -> 合肥
+四川 -> 成都
+
+query: 浙江 -> 杭州
+安徽 -> 合肥
+四川 ->
+response:  成都
+广东 -> 广州
+江苏 -> 南京
+浙江 -> 杭州
+安徽 -> 合肥
+四川 -> 成都
+"""
+```
+
+
+使用openai（同步）:
 ```python
 from openai import OpenAI
 client = OpenAI(
@@ -484,8 +567,39 @@ CUDA_VISIBLE_DEVICES=0 swift deploy --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx-merged
 
 客户端示例代码同原始模型.
 
+## 多LoRA部署
+
+目前pt方式部署模型已经支持`peft>=0.10.0`进行多LoRA部署，具体方法为：
+
+- 确保部署时`merge_lora`为`False`
+- 使用`--lora_modules`参数,  可以查看[命令行文档](命令行参数.md)
+- 推理时指定lora tuner的名字到模型字段
+
+举例：
+
+```shell
+# 假设从llama3-8b-instruct训练了一个名字叫卡卡罗特的LoRA模型
+# 服务端
+swift deploy --ckpt_dir /mnt/ckpt-1000 --infer_backend pt --lora_modules my_tuner=/mnt/my-tuner
+# 会加载起来两个tuner，一个是`/mnt/ckpt-1000`的`default-lora`，一个是`/mnt/my-tuner`的`my_tuner`
+
+# 客户端
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+"model": "my-tuner",
+"messages": [{"role": "user", "content": "who are you?"}],
+"max_tokens": 256,
+"temperature": 0
+}'
+# resp: 我是卡卡罗特...
+# 如果指定mode='llama3-8b-instruct'，则返回I'm llama3...，即原模型的返回值
+```
+
+> [!NOTE]
+>
+> `--ckpt_dir`参数如果是个lora路径，则原来的default会被加载到default-lora的tuner上，其他的tuner需要通过`lora_modules`自行加载
 
 ## VLLM & LoRA
+
 VLLM & LoRA支持的模型可以查看: https://docs.vllm.ai/en/latest/models/supported_models.html
 
 ### 准备LoRA
@@ -496,24 +610,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 swift sft \
     --model_type llama2-7b-chat \
-    --dataset sharegpt-gpt4-mini \
-    --train_dataset_sample 1000 \
-    --logging_steps 5 \
+    --dataset self-cognition#500 sharegpt-gpt4:default#1000 \
     --max_length 4096 \
-    --learning_rate 5e-5 \
-    --warmup_ratio 0.4 \
+    --learning_rate 1e-4 \
     --output_dir output \
     --lora_target_modules ALL \
-    --self_cognition_sample 500 \
     --model_name 小黄 'Xiao Huang' \
     --model_author 魔搭 ModelScope \
-```
-
-将lora从swift格式转换成peft格式:
-```shell
-CUDA_VISIBLE_DEVICES=0 swift export \
-    --ckpt_dir output/llama2-7b-chat/vx-xxx/checkpoint-xxx \
-    --to_peft_format true
 ```
 
 
@@ -522,7 +625,7 @@ CUDA_VISIBLE_DEVICES=0 swift export \
 推理:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift infer \
-    --ckpt_dir output/llama2-7b-chat/vx-xxx/checkpoint-xxx-peft \
+    --ckpt_dir output/llama2-7b-chat/vx-xxx/checkpoint-xxx \
     --infer_backend vllm \
     --vllm_enable_lora true
 ```
@@ -545,7 +648,7 @@ from swift.llm import (
     get_template, inference_stream_vllm, LoRARequest, inference_vllm
 )
 
-lora_checkpoint = 'output/llama2-7b-chat/vx-xxx/checkpoint-xxx-peft'
+lora_checkpoint = 'output/llama2-7b-chat/vx-xxx/checkpoint-xxx'
 lora_request = LoRARequest('default-lora', 1, lora_checkpoint)
 
 model_type = ModelType.llama2_7b_chat
@@ -588,7 +691,7 @@ response:  Hello! I'm just an AI assistant, here to help you with any questions 
 **服务端**:
 ```shell
 CUDA_VISIBLE_DEVICES=0 swift deploy \
-    --ckpt_dir output/llama2-7b-chat/vx-xxx/checkpoint-xxx-peft \
+    --ckpt_dir output/llama2-7b-chat/vx-xxx/checkpoint-xxx \
     --infer_backend vllm \
     --vllm_enable_lora true
 ```

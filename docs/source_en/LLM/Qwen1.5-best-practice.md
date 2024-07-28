@@ -2,6 +2,9 @@
 
 This introduces how to perform inference, self-cognition fine-tuning, quantization, and deployment on **Qwen1.5-7B-Chat** and **Qwen1.5-72B-Chat**, corresponding to **low-resource and high-resource** environments respectively.
 
+The best practice for self-cognition fine-tuning, inference and deployment of Qwen2-72B-Instruct using dual-card 80GiB A100 can be found [here](https://github.com/modelscope/swift/issues/1092).
+
+
 ## Table of Contents
 - [Environment Preparation](#environment-preparation)
 - [Qwen1.5-7B-Chat](#qwen15-7b-chat)
@@ -124,7 +127,6 @@ gen = inference_stream_vllm(llm_engine, template, request_list)
 print_idx = 0
 print(f'query: {query}\nresponse: ', end='')
 for resp_list in gen:
-    request = request_list[0]
     resp = resp_list[0]
     response = resp['response']
     delta = response[print_idx:]
@@ -184,15 +186,12 @@ from swift.llm import DatasetName, ModelType, SftArguments, sft_main
 
 sft_args = SftArguments(
     model_type=ModelType.qwen1half_7b_chat,
-    dataset=[DatasetName.alpaca_zh, DatasetName.alpaca_en],
-    train_dataset_sample=1000,
-    logging_steps=5,
+    dataset=[f'{DatasetName.alpaca_zh}#500', f'{DatasetName.alpaca_en}#500',
+             f'{DatasetName.self_cognition}#500'],
     max_length=2048,
-    learning_rate=5e-5,
-    warmup_ratio=0.4,
+    learning_rate=1e-4,
     output_dir='output',
     lora_target_modules=['ALL'],
-    self_cognition_sample=500,
     model_name=['小黄', 'Xiao Huang'],
     model_author=['魔搭', 'ModelScope'])
 output = sft_main(sft_args)
@@ -205,21 +204,16 @@ If you want to train on a 3090 machine, you can **reduce max_length** to 1024, u
 Using model parallelism:
 
 ```shell
-
 # Experimental environment: 2 * 3090
 # 2 * 18GB GPU memory
 CUDA_VISIBLE_DEVICES=0,1 \
 swift sft \
     --model_type qwen1half-7b-chat \
-    --dataset alpaca-zh alpaca-en \
-    --train_dataset_sample 1000 \
-    --logging_steps 5 \
+    --dataset alpaca-zh#500 alpaca-en#500 self-cognition#500 \
     --max_length 2048 \
-    --learning_rate 5e-5 \
-    --warmup_ratio 0.4 \
+    --learning_rate 1e-4 \
     --output_dir output \
     --lora_target_modules ALL \
-    --self_cognition_sample 500 \
     --model_name 小黄 'Xiao Huang' \
     --model_author 魔搭 ModelScope \
 ```
@@ -232,15 +226,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 swift sft \
     --model_type qwen1half-7b-chat \
-    --dataset alpaca-zh alpaca-en \
-    --train_dataset_sample 1000 \
-    --logging_steps 5 \
+    --dataset alpaca-zh#500 alpaca-en#500 self-cognition#500 \
     --max_length 2048 \
-    --learning_rate 5e-5 \
-    --warmup_ratio 0.4 \
+    --learning_rate 1e-4 \
     --output_dir output \
     --lora_target_modules ALL \
-    --self_cognition_sample 500 \
     --model_name 小黄 'Xiao Huang' \
     --model_author 魔搭 ModelScope \
     --deepspeed default-zero2 \
@@ -355,7 +345,6 @@ gen = inference_stream_vllm(llm_engine, template, request_list)
 print_idx = 0
 print(f'query: {query}\nresponse: ', end='')
 for resp_list in gen:
-    request = request_list[0]
     resp = resp_list[0]
     response = resp['response']
     delta = response[print_idx:]
@@ -421,7 +410,9 @@ for query in ['78654+657=?', "What to do if I can't fall asleep at night"]:
 
     print(f'query: {query}')
     print('response: ', end='')
+    response = ''
     for chunk in stream_resp:
+        response += chunk.choices[0].delta.content
         print(chunk.choices[0].delta.content, end='', flush=True)
     print()
     messages.append({'role': 'assistant', 'content': response})
@@ -486,15 +477,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 swift sft \
     --model_type qwen1half-72b-chat \
-    --dataset alpaca-zh alpaca-en \
-    --train_dataset_sample 1000 \
-    --logging_steps 5 \
+    --dataset alpaca-zh#500 alpaca-en#500 self-cognition#500 \
     --max_length 4096 \
-    --learning_rate 5e-5 \
-    --warmup_ratio 0.4 \
+    --learning_rate 1e-4 \
     --output_dir output \
     --lora_target_modules ALL \
-    --self_cognition_sample 500 \
     --model_name 小黄 'Xiao Huang' \
     --model_author 魔搭 ModelScope \
     --deepspeed default-zero3 \
@@ -583,7 +570,9 @@ for query in ['78654+657=?', "What to do if I can't fall asleep at night"]:
 
     print(f'query: {query}')
     print('response: ', end='')
+    response = ''
     for chunk in stream_resp:
+        response += chunk.choices[0].delta.content
         print(chunk.choices[0].delta.content, end='', flush=True)
     print()
     messages.append({'role': 'assistant', 'content': response})

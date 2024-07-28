@@ -5,20 +5,21 @@ import hashlib
 import os
 import shutil
 import threading
+import uuid
 from dataclasses import asdict, dataclass, field
 from types import FunctionType
-from typing import Dict, List, Optional, OrderedDict, Union
+from typing import Dict, Optional, Union
 
 import json
 import numpy as np
 import torch
+from modelscope import snapshot_download
+from modelscope.hub.utils.utils import get_cache_dir
 from packaging import version
 from peft.utils import CONFIG_NAME
 from peft.utils import ModulesToSaveWrapper as _ModulesToSaveWrapper
 from peft.utils import _get_submodules
 
-from swift.hub.snapshot_download import snapshot_download
-from swift.hub.utils.utils import get_cache_dir
 from swift.tuners.module_mapping import ModelKeys
 from swift.utils.constants import BIN_EXTENSIONS
 from swift.utils.logger import get_logger
@@ -130,12 +131,14 @@ class SwiftOutput:
                 >>> def mark_trainable_callback(model):
                 >>>     mark_lora_as_trainable(model, config.bias)
         optimizer_group_callback (`FunctionType`): A callback returned the param group cared by the tuner.
+        load_state_dict_callback (`FunctionType`): A callback called before load_state_dict of the tuner.
     """
 
     config: SwiftConfig = None
     state_dict_callback: FunctionType = None
     mark_trainable_callback: FunctionType = None
     optimizer_group_callback: FunctionType = None
+    load_state_dict_callback: FunctionType = None
 
 
 class ActivationMixin:
@@ -151,6 +154,12 @@ class ActivationMixin:
         if not self._unique_thread and not ActivationMixin.REMINEDED:
             ActivationMixin.REMINEDED = True
             logger.warn('Using multiple thread mode, gradient checkpointing is not supported.')
+
+    def mark_all_sub_modules_as_plugin(self: torch.nn.Module):
+        self.plugin = True
+        for name, module in self.named_modules():
+            if 'base_layer' not in name:
+                module.plugin = True
 
     @property
     def indent(self):
@@ -176,11 +185,15 @@ class ActivationMixin:
 
 class OffloadHelper:
 
-    sub_dir = 'offload_cache'
-    cache_dir = os.path.join(get_cache_dir(), sub_dir)
-    shutil.rmtree(cache_dir, ignore_errors=True)
-    os.makedirs(cache_dir, exist_ok=True)
-    index = {}
+    def __init__(self):
+        sub_dir = os.path.join('offload_cache', str(uuid.uuid4().hex))
+        self.cache_dir = os.path.join(get_cache_dir(), sub_dir)
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.index = {}
+
+    def __del__(self):
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
 
     @staticmethod
     def offload_weight(weight, weight_name, offload_folder, index=None):
@@ -221,26 +234,24 @@ class OffloadHelper:
 
         return weight
 
-    @staticmethod
-    def offload_disk(module: torch.nn.Module, adapter_name, module_key):
+    def offload_disk(self, module: torch.nn.Module, adapter_name, module_key):
         key = adapter_name + ':' + module_key
         md5 = hashlib.md5(key.encode('utf-8')).hexdigest()
-        sub_folder = os.path.join(OffloadHelper.cache_dir, md5)
+        sub_folder = os.path.join(self.cache_dir, md5)
         os.makedirs(sub_folder, exist_ok=True)
         state_dict = module.state_dict()
-        OffloadHelper.index[md5] = {}
+        self.index[md5] = {}
         for key, tensor in state_dict.items():
-            OffloadHelper.offload_weight(tensor, key, sub_folder, OffloadHelper.index[md5])
+            OffloadHelper.offload_weight(tensor, key, sub_folder, self.index[md5])
 
-    @staticmethod
-    def load_disk(module: torch.nn.Module, adapter_name, module_key):
+    def load_disk(self, module: torch.nn.Module, adapter_name, module_key):
         key = adapter_name + ':' + module_key
         md5 = hashlib.md5(key.encode('utf-8')).hexdigest()
-        sub_folder = os.path.join(OffloadHelper.cache_dir, md5)
+        sub_folder = os.path.join(self.cache_dir, md5)
         state_dict = {}
-        for key, value in OffloadHelper.index[md5].items():
+        for key, value in self.index[md5].items():
             file = os.path.join(sub_folder, f'{key}.dat')
-            state_dict[key] = OffloadHelper.load_offloaded_weight(file, OffloadHelper.index[md5][key])
+            state_dict[key] = OffloadHelper.load_offloaded_weight(file, self.index[md5][key])
         if version.parse(torch.__version__) >= version.parse('2.1.0'):
             module.load_state_dict(state_dict, assign=True)
         else:
@@ -263,6 +274,8 @@ class OffloadHelper:
 
 
 class SwiftAdapter:
+
+    offload_helper = OffloadHelper()
 
     @staticmethod
     def prepare_model(model: torch.nn.Module, config: SwiftConfig, adapter_name: str) -> SwiftOutput:
@@ -294,7 +307,7 @@ class SwiftAdapter:
                 module.to('cpu')
         elif offload == 'meta':
             if str(device) != 'meta':
-                OffloadHelper.offload_disk(module, adapter_name=adapter_name, module_key=module_key)
+                SwiftAdapter.offload_helper.offload_disk(module, adapter_name=adapter_name, module_key=module_key)
                 module.to('meta')
         else:
             raise NotImplementedError
@@ -309,9 +322,13 @@ class SwiftAdapter:
             module.to(module.origin_device)
             delattr(module, 'origin_device')
         elif str(device) == 'meta':
-            OffloadHelper.load_disk(module, adapter_name=adapter_name, module_key=module_key)
+            SwiftAdapter.offload_helper.load_disk(module, adapter_name=adapter_name, module_key=module_key)
             module.to(module.origin_device)
             delattr(module, 'origin_device')
+
+    @staticmethod
+    def state_dict_load_hook(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]):
+        pass
 
     @staticmethod
     def has_additional_modules():
