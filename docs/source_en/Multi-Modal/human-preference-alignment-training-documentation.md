@@ -29,9 +29,9 @@ Vision human preference alignment training typically requires data in the format
 **Custom Dataset Format**
 
 ```jsonl
-{"system": "123", "query": "11111", "response": "22222", "rejected_response": "33333", "images": ["image_path"], "history": [["AAAAA", "BBBBB"], ["CCCCC", "DDDDD"]]}
-{"system": "123", "query": "aaaaa", "response": "bbbbb", "rejected_response": "ccccc", "images": ["image_path"], "history": [["AAAAA", "BBBBB"], ["CCCCC", "DDDDD"]]}
-{"system": "123", "query": "AAAAA", "response": "BBBBB", "rejected_response": "CCCCC", "images": ["image_path"], "history": [["AAAAA", "BBBBB"], ["CCCCC", "DDDDD"]]}
+{"system": "123", "query": "11111", "response": "22222", "rejected_response": "33333", "images": ["image_path"], "history": [["query1", "response1"], ["query2", "response2"]]}
+{"system": "123", "query": "aaaaa", "response": "bbbbb", "rejected_response": "ccccc", "images": ["image_path"], "history": [["query1", "response1"], ["query2", "response2"]]}
+{"system": "123", "query": "AAAAA", "response": "BBBBB", "rejected_response": "CCCCC", "images": ["image_path"], "history": [["query1", "response1"], ["query2", "response2"]]}
 ```
 
 Different models have varying support for the number of images. Please refer to the corresponding best practices document for each model.
@@ -48,7 +48,7 @@ Hyperparameters
 
 It is recommended to train with the preferred answer part of the preference dataset before starting DPO training to ensure data fits the distribution requirements of the DPO algorithm.
 
-We also mix sft loss in the DPO loss to stabilize training; you can adjust the sft loss coefficient by setting the hyperparameter `sft_beta`, the default is 0.1
+We also mix sft loss in the DPO loss to stabilize training; you can adjust the sft loss coefficient by setting the hyperparameter `rpo_alpha`, the default is `1.`.
 
 For training script, we provide single card/multi-card device map/multi-card ddp versions, for brevity, only the single card version is given for subsequent algorithms.
 
@@ -59,7 +59,7 @@ swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \
@@ -77,7 +77,7 @@ swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \
@@ -90,13 +90,16 @@ swift rlhf \
     --save_total_limit  2
 
 # DDP + MP
+nproc_per_node=2
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NPROC_PER_NODE=2 \
+NPROC_PER_NODE=$nproc_per_node \
+MASTER_PORT=29500 \
 swift rlhf \
     --rlhf_type dpo \
     --model_type llava1_6-mistral-7b-instruct \
     --beta 0.1 \
-    --sft_beta 0.1 \
+    --rpo_alpha 0.1 \
     --sft_type  lora \
     --dataset rlaif-v#1000 \
     --num_train_epochs  2  \

@@ -4,14 +4,20 @@ import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from datasets import Dataset as HfDataset
+from datasets import IterableDataset as HfIterableDataset
 from tqdm import tqdm
 from transformers.utils import strtobool
 
+from swift.utils import get_logger
 from .media import MediaTag
 from .template import History
 
-PreprocessFunc = Callable[[HfDataset], HfDataset]
 dataset_enable_cache = strtobool(os.environ.get('DATASET_ENABLE_CACHE', 'False'))
+
+DATASET_TYPE = Union[HfDataset, HfIterableDataset]
+PreprocessFunc = Callable[[DATASET_TYPE], DATASET_TYPE]
+
+logger = get_logger()
 
 
 def _reduce_columns(cls: type) -> type:
@@ -23,10 +29,14 @@ def _reduce_columns(cls: type) -> type:
     preprocess = cls.preprocess
     cls._patching = True
 
-    def new_call_func(self, dataset: HfDataset) -> HfDataset:
+    def new_call_func(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
         self.column_state = set(['images', 'videos', 'audios'])
         dataset = call_func(self, dataset)
-        for k in dataset.features.keys():
+        if isinstance(dataset, HfIterableDataset) and dataset.features is None:
+            features = next(iter(dataset)).keys()
+        else:
+            features = dataset.features.keys()
+        for k in features:
             if k not in self.column_state:
                 dataset = dataset.remove_columns([k])
         return dataset
@@ -106,7 +116,9 @@ class RowPreprocessMixin:
 
 class SwiftPreprocessor:
 
-    def __call__(self, dataset: HfDataset) -> HfDataset:
+    def __call__(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
+        if isinstance(dataset, HfIterableDataset):
+            return dataset
         if 'history' in dataset.features:
             old_history = dataset['history']
             has_history = False
@@ -130,7 +142,6 @@ class SwiftPreprocessor:
         return dataset
 
 
-@_reduce_columns
 class AlpacaPreprocessor(MediaMixin, RowPreprocessMixin):
 
     def __init__(self, concat_inst_inp: Optional[Callable[[str, str], str]] = None, **kwargs):
@@ -167,10 +178,11 @@ class AlpacaPreprocessor(MediaMixin, RowPreprocessMixin):
                 row[self.media_key] = medias
         return row
 
-    def __call__(self, dataset: HfDataset) -> HfDataset:
-        dataset = dataset.map(
-            self.preprocess,
-            load_from_cache_file=dataset_enable_cache).filter(lambda row: row.get('response') is not None)
+    def __call__(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
+        kwargs = {}
+        if not isinstance(dataset, HfIterableDataset):
+            kwargs['load_from_cache_file'] = dataset_enable_cache
+        dataset = dataset.map(self.preprocess, **kwargs).filter(lambda row: row.get('response'))
         if self.media_type and isinstance(self.media_key, str) and self.media_key != self.media_name:
             dataset = dataset.rename_columns({self.media_key: self.media_name})
         return dataset
@@ -182,7 +194,6 @@ def _default_repair_conversations(s: Union[str, Any]) -> Any:
     return s
 
 
-@_reduce_columns
 class ConversationsPreprocessor(MediaMixin, RowPreprocessMixin):
 
     def __init__(self,
@@ -237,7 +248,11 @@ class ConversationsPreprocessor(MediaMixin, RowPreprocessMixin):
                 assert q[self.from_key] in [self.user_role, self.tool_role]
                 assert r[self.from_key] == self.assistant_role
                 h.append([q[self.value_key], r[self.value_key]])
-                hr.append([q[self.from_key], r[self.from_key]])
+                _q_role = q[self.from_key]
+                _r_role = r[self.from_key]
+                _q_role = _q_role if _q_role == 'tool' else 'user'
+                _r_role = _r_role if _r_role == 'tool' else 'assistant'
+                hr.append([_q_role, _r_role])
             query = conversations[-2][self.value_key]
             query_role = conversations[-2][self.from_key]
             query_role = query_role if query_role == 'tool' else 'user'
@@ -260,16 +275,18 @@ class ConversationsPreprocessor(MediaMixin, RowPreprocessMixin):
                 else:
                     row[self.media_key] = medias
             return row
-        except (AssertionError, SyntaxError):
+        except (AssertionError, SyntaxError) as e:
+            logger.error(e)
             if self.error_strategy == 'raise':
                 raise ValueError(f'conversations: {conversations}')
             else:
                 return self.empty_row
 
-    def __call__(self, dataset: HfDataset) -> HfDataset:
-        dataset = dataset.map(
-            self.preprocess,
-            load_from_cache_file=dataset_enable_cache).filter(lambda row: row.get('response') is not None)
+    def __call__(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
+        kwargs = {}
+        if not isinstance(dataset, HfIterableDataset):
+            kwargs['load_from_cache_file'] = dataset_enable_cache
+        dataset = dataset.map(self.preprocess, **kwargs).filter(lambda row: row.get('response') is not None)
         if self.media_type and isinstance(self.media_key, str) and self.media_key != self.media_name:
             dataset = dataset.rename_columns({self.media_key: self.media_name})
         return dataset
@@ -324,9 +341,11 @@ class ListPreprocessor(MediaMixin, RowPreprocessMixin):
                 return self.empty_row
         return row
 
-    def __call__(self, dataset: HfDataset):
-        dataset = dataset.map(
-            self.preprocess, load_from_cache_file=dataset_enable_cache).filter(lambda d: d.get('response'))
+    def __call__(self, dataset: DATASET_TYPE) -> DATASET_TYPE:
+        kwargs = {}
+        if not isinstance(dataset, HfIterableDataset):
+            kwargs['load_from_cache_file'] = dataset_enable_cache
+        dataset = dataset.map(self.preprocess, **kwargs).filter(lambda d: d.get('response'))
         if self.media_type and isinstance(self.media_key, str) and self.media_key != self.media_name:
             dataset = dataset.rename_columns({self.media_key: self.media_name})
         return dataset
@@ -350,7 +369,8 @@ class RenameColumnsPreprocessor:
 
     def __call__(self, dataset: HfDataset) -> HfDataset:
         for old_name, new_name in self.rename_mapping.items():
-            dataset = dataset.rename_column(old_name, new_name)
+            if old_name in dataset.features:
+                dataset = dataset.rename_column(old_name, new_name)
         return dataset
 
 
@@ -413,11 +433,21 @@ class SmartPreprocessor:
             'sharegpt': {
                 'required': ['conversation'],
                 'preprocessor': preprocess_sharegpt
+            },
+            'pretrain': {
+                'required': ['text'],
+                'preprocessor': RenameColumnsPreprocessor({
+                    'prompt': 'query',
+                    'text': 'response'
+                })
             }
         }
 
-    def _get_preprocessor(self, dataset: HfDataset) -> PreprocessFunc:
-        keys = set(dataset.features.keys())
+    def _get_preprocessor(self, dataset: DATASET_TYPE) -> PreprocessFunc:
+        if isinstance(dataset, HfIterableDataset) and dataset.features is None:
+            keys = set(next(iter(dataset)).keys())
+        else:
+            keys = set(dataset.features.keys())
         required_keys_mapping = {k: v['required'] for k, v in self.preprocessor_mapping.items()}
         for k, required_keys in required_keys_mapping.items():
             if len(set(required_keys) - keys) == 0:

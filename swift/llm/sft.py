@@ -5,22 +5,25 @@ from typing import Any, Dict, Optional, Tuple
 
 import json
 import torch
+import transformers
 from datasets import Dataset as HfDataset
 from modelscope import BitsAndBytesConfig, GenerationConfig
+from packaging import version
 from transformers import IntervalStrategy
 from transformers.integrations import is_deepspeed_zero3_enabled
-from transformers.utils import is_torch_npu_available
+from transformers.utils import is_torch_npu_available, strtobool
 
 from swift.torchacc_utils import patch_acc_model
-from swift.trainers import Seq2SeqTrainer
+from swift.trainers import TrainerFactory
 from swift.trainers.utils import can_return_loss, find_labels
 from swift.utils import (append_to_jsonl, check_json_format, compute_acc_metrics, compute_nlg_metrics, get_logger,
                          get_main, get_model_info, is_ddp_plus_mp, is_dist, is_master, plot_images,
                          preprocess_logits_for_metrics, seed_everything, show_layers, use_torchacc)
 from .accelerator import ta_accelerate
 from .tuner import prepare_model
-from .utils import (LazyLLMDataset, SftArguments, Template, dataset_map, get_dataset, get_model_tokenizer, get_template,
-                    get_time_info, print_example, set_generation_config, sort_by_max_length, stat_dataset)
+from .utils import (TEMPLATE_MAPPING, LazyLLMDataset, PtArguments, RLHFArguments, SftArguments, Template, dataset_map,
+                    get_dataset, get_model_tokenizer, get_template, get_time_info, print_example, set_generation_config,
+                    sort_by_max_length, stat_dataset)
 
 logger = get_logger()
 
@@ -33,7 +36,10 @@ def _get_train_val_dataset(args: SftArguments) -> Tuple[HfDataset, Optional[HfDa
         args.dataset_seed,
         check_dataset_strategy=args.check_dataset_strategy,
         model_name=args.model_name,
-        model_author=args.model_author)
+        model_author=args.model_author,
+        streaming=args.streaming,
+        streaming_val_size=args.streaming_val_size,
+        streaming_buffer_size=args.streaming_buffer_size)
     if len(args.val_dataset) > 0:
         # Loading val dataset
         _, val_dataset = get_dataset(
@@ -42,9 +48,13 @@ def _get_train_val_dataset(args: SftArguments) -> Tuple[HfDataset, Optional[HfDa
             args.dataset_seed,
             check_dataset_strategy=args.check_dataset_strategy,
             model_name=args.model_name,
-            model_author=args.model_author)
+            model_author=args.model_author,
+            streaming=args.streaming,
+            streaming_val_size=args.streaming_val_size,
+            streaming_buffer_size=args.streaming_buffer_size)
 
     train_dataset, val_dataset = args._handle_dataset_compat(train_dataset, val_dataset)
+    # The random shuffling of the training set occurs in the dataloader of the trainer.
     logger.info(f'train_dataset: {train_dataset}')
     logger.info(f'val_dataset: {val_dataset}')
     return train_dataset, val_dataset
@@ -55,7 +65,7 @@ def llm_sft_megatron(args: SftArguments) -> Dict[str, Any]:
         f'Please run `CUDA_VISIBLE_DEVICES=0 swift export --model_type {args.model_type} --tp {args.tp} --pp {args.pp} '
         f'--megatron_output_dir {args.resume_from_checkpoint} --to_megatron true` '
         'to convert the weights to Megatron format.')
-    from swift.llm.megatron import (MegatronArguments, get_model_seires, patch_megatron, model_provider, forward_step,
+    from swift.llm.megatron import (MegatronArguments, patch_megatron, get_megatron_model_convert, forward_step,
                                     train_valid_test_datasets_provider as _train_valid_test_datasets_provider)
     from megatron.core.enums import ModelType
     from megatron.training import pretrain
@@ -69,16 +79,16 @@ def llm_sft_megatron(args: SftArguments) -> Dict[str, Any]:
     train_dataset, val_dataset = _get_train_val_dataset(args)
     td0, tkwargs0 = template.encode(train_dataset[0])
     print_example(td0, tokenizer, tkwargs0)
-    train_dataset = LazyLLMDataset(train_dataset, template)
+    train_dataset = LazyLLMDataset(train_dataset, template.encode)
     if val_dataset is not None:
-        val_dataset = LazyLLMDataset(val_dataset, template)
+        val_dataset = LazyLLMDataset(val_dataset, template.encode)
 
     res = MegatronArguments.load_megatron_config(tokenizer.model_dir)
     res.update(MegatronArguments.from_sft_args(args, train_dataset, val_dataset))
-    res['model_series'] = get_model_seires(args.model_type)
     megatron_args = MegatronArguments(**res)
     extra_args = megatron_args.parse_to_megatron()
 
+    model_provider, _ = get_megatron_model_convert(args.model_type)
     train_valid_test_datasets_provider = partial(
         _train_valid_test_datasets_provider, train_dataset=train_dataset, val_dataset=val_dataset, template=template)
     train_valid_test_datasets_provider.is_distributed = True
@@ -105,13 +115,12 @@ def llm_sft_megatron(args: SftArguments) -> Dict[str, Any]:
     return {}
 
 
-def llm_sft(args: SftArguments) -> Dict[str, Any]:
-    logger.info(f'args: {args}')
-    seed_everything(args.seed)
-    if args.train_backend == 'megatron':
-        return llm_sft_megatron(args)
+def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
 
-    training_args = args.training_args
+    if args.gpu_memory_fraction is not None:
+        for device_id in range(torch.cuda.device_count()):
+            torch.cuda.set_per_process_memory_fraction(max(min(args.gpu_memory_fraction, 1.0), 0.01), device=device_id)
+
     if is_torch_npu_available():
         print(f'device_count: {torch.npu.device_count()}')
     else:
@@ -119,21 +128,13 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
     print(f'rank: {args.rank}, local_rank: {args.local_rank}, '
           f'world_size: {args.world_size}, local_world_size: {args.local_world_size}')
 
-    if args.gpu_memory_fraction is not None:
-        for device_id in range(torch.cuda.device_count()):
-            torch.cuda.set_per_process_memory_fraction(max(min(args.gpu_memory_fraction, 1.0), 0.01), device=device_id)
-
     # Loading Model and Tokenizer
     if is_deepspeed_zero3_enabled() or os.environ.get('ACCELERATE_USE_FSDP', 'False') == 'true':
         model_kwargs = {'device_map': None}
     elif is_torch_npu_available():
         model_kwargs = {'device_map': args.local_rank if args.local_rank >= 0 else 0}
-    elif args.device_map_config_path is not None:
-        cwd = os.getcwd()
-        config_path = args.device_map_config_path if os.path.isabs(args.device_map_config_path) else os.path.join(
-            cwd, args.device_map_config_path)
-        with open(config_path, 'r') as json_file:
-            model_kwargs = {'device_map': json.load(json_file)}
+    elif args.device_map_config is not None:
+        model_kwargs = {'device_map': args.device_map_config}
     else:
         model_kwargs = {'low_cpu_mem_usage': True}
         if is_dist() and not is_ddp_plus_mp():
@@ -151,6 +152,7 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
             for i, mem in zip(range(max(args.local_rank, 0), n_gpu, args.local_world_size), args.device_max_memory)
         }
 
+    # quantization
     if args.quant_method == 'hqq':
         from transformers import HqqConfig
         if args.hqq_dynamic_config_path is not None:
@@ -203,12 +205,16 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         quant_method=args.quant_method,
         is_training=True,
         **kwargs)
+
+    if hasattr(model, 'hf_device_map'):
+        logger.info(f'model.hf_device_map: {model.hf_device_map}')
     for k in ['gptq', 'awq', 'aqlm']:
         if getattr(model, f'is_{k}', None):
             args.quant_method = k
             logger.info(f'Setting args.quant_method: {args.quant_method}')
             break
     logger.info(f'model_config: {model.config}')
+
     generation_config = GenerationConfig(
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -219,9 +225,9 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         num_beams=args.num_beams,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id)
-    logger.info(f'generation_config: {generation_config}')
     set_generation_config(model, generation_config)
-    training_args.generation_config = generation_config
+    logger.info(f'model.generation_config: {model.generation_config}')
+    args.training_args.generation_config = model.generation_config
 
     if use_torchacc():
         import torchacc as ta
@@ -230,6 +236,9 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         label_names = find_labels(model)
         return_loss = can_return_loss(model)
         model = patch_acc_model(model, args)
+        model.label_names = label_names
+        model.return_loss = return_loss
+
     # Preparing LoRA
     model, callbacks = prepare_model(model, args)
 
@@ -237,6 +246,8 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
     logger.info(model)
     model_info = get_model_info(model)
     logger.info(model_info)
+    if isinstance(msg, dict):
+        msg['model_info'] = model_info
 
     if args.gradient_checkpointing:
         model.config.use_cache = False  # fix transformers==4.36
@@ -253,10 +264,8 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
             args.bf16,
             args.fp16,
             gradient_checkpointing=True,
-            fsdp_flatten_parameters=False)
+            fsdp_flatten_parameters=(args.sft_type == 'full'))
 
-    train_dataset, val_dataset = _get_train_val_dataset(args)
-    training_args.train_dataset_sample = train_dataset.shape[0] if train_dataset is not None else 0  # torchacc
     template_kwargs = {}
     template_kwargs['use_loss_scale'] = args.use_loss_scale
     if args.loss_scale_config_path is not None:
@@ -268,6 +277,7 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
     template_kwargs['tools_prompt'] = args.tools_prompt
     if args.sequence_parallel_size and args.sequence_parallel_size > 1:
         template_kwargs['sequence_parallel_size'] = args.sequence_parallel_size
+    template_kwargs['rescale_image'] = args.rescale_image
     template: Template = get_template(
         args.template_type,
         tokenizer,
@@ -276,9 +286,52 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         args.truncation_strategy,
         model=model,
         **template_kwargs)
+    template._is_training = True
+    if args.streaming:
+        template.encode = partial(template.encode, streaming=args.streaming)
     args.system = template.default_system
     logger.info(f'system: {args.system}')
     logger.info(f'args.lazy_tokenize: {args.lazy_tokenize}')
+
+    if not isinstance(args, RLHFArguments):
+        return model, template, callbacks
+
+    # ref_model
+    ref_model = None
+    if not args.ref_model_free and (args.ref_model_type or args.sft_type == 'full'):
+        if args.ref_model_type:
+            kwargs['model_id_or_path'] = args.ref_model_id_or_path
+            kwargs['revision'] = args.ref_model_revision
+        else:
+            kwargs['model_id_or_path'] = args.model_id_or_path
+            kwargs['revision'] = args.model_revision
+
+        # Be aware of the unexpected behavior caused by double monkey patching.
+        ref_model, _ = get_model_tokenizer(
+            args.ref_model_type or args.model_type,
+            args.torch_dtype,
+            model_kwargs,
+            quant_method=args.quant_method,
+            **kwargs)
+        ref_model.requires_grad_(False).eval()
+
+    template.ref_model = ref_model
+    return model, ref_model, template, callbacks
+
+
+def prepare_dataset(args, template: Template, msg: Optional[Dict[str, Any]] = None):
+    training_args = args.training_args
+    train_dataset, val_dataset = _get_train_val_dataset(args)
+    if use_torchacc():
+        training_args.train_dataset_sample = train_dataset.shape[0] if train_dataset is not None else 0
+
+    if val_dataset is None:
+        training_args.evaluation_strategy = IntervalStrategy.NO
+        training_args.eval_strategy = IntervalStrategy.NO
+        training_args.do_eval = False
+
+    tokenizer = template.tokenizer
+    dataset_info = {}
     if args.packing:
         from swift.llm.utils.utils import ConstantLengthDataset
         train_dataset = ConstantLengthDataset.get_packed_dataset(
@@ -286,19 +339,29 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         if val_dataset is not None:
             val_dataset = ConstantLengthDataset.get_packed_dataset(
                 template, val_dataset, args.max_length, lazy_tokenize=args.lazy_tokenize)
-        dataset_info = {}
         if not args.lazy_tokenize:
-            td0 = train_dataset[0]
-            print_example(td0, tokenizer, {})
+            print_example(train_dataset[0], tokenizer, {})
             dataset_info['train_dataset'] = stat_dataset(train_dataset)
             if val_dataset is not None:
                 dataset_info['val_dataset'] = stat_dataset(val_dataset)
     elif not args.lazy_tokenize:
-        dataset_info = {}
-        logger.info(f'Using num_proc: {args.preprocess_num_proc}')
-        train_dataset = dataset_map(train_dataset, template.encode, args.preprocess_num_proc)
+        model = template.model
+        if not args.streaming:
+            if args.preprocess_num_proc > 1:
+                use_model = TEMPLATE_MAPPING[args.template_type].get('use_model', False)
+                if use_model:
+                    args.preprocess_num_proc = 1
+                    logger.warning('The current Template does not support num_proc. '
+                                   f'Setting args.preprocess_num_proc to: {args.preprocess_num_proc}')
+                else:
+                    template.model = None
+            logger.info(f'Using num_proc: {args.preprocess_num_proc}')
+        td0, tkwargs0 = template.encode(train_dataset[0])
+        print_example(td0, tokenizer, tkwargs0)
+        train_dataset = dataset_map(train_dataset, template.encode, args.preprocess_num_proc, streaming=args.streaming)
         if val_dataset is not None:
-            val_dataset = dataset_map(val_dataset, template.encode, args.preprocess_num_proc)
+            val_dataset = dataset_map(val_dataset, template.encode, args.preprocess_num_proc, streaming=args.streaming)
+        template.model = model  # recover
         if args.test_oom_error:
             train_dataset = sort_by_max_length(train_dataset, 20000)
         # Data analysis
@@ -309,55 +372,65 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
             raise AttributeError('Failed to access dataset attributes,train_dataset is None. This might be because:\n'
                                  '(1) The dataset contains None for input or labels;\n'
                                  "(2) The 'max_length' setting is too short causing data truncation.")
-        td0, tkwargs0 = train_dataset.data[0]
-        print_example(td0, tokenizer, tkwargs0)
-        dataset_info['train_dataset'] = stat_dataset(train_dataset)
-        if val_dataset is not None:
-            dataset_info['val_dataset'] = stat_dataset(val_dataset)
+        if not args.streaming:
+            dataset_info['train_dataset'] = stat_dataset(train_dataset)
+            if val_dataset is not None:
+                dataset_info['val_dataset'] = stat_dataset(val_dataset)
     else:
-        dataset_info = None
         td0, tkwargs0 = template.encode(train_dataset[0])
         print_example(td0, tokenizer, tkwargs0)
-        train_dataset = LazyLLMDataset(train_dataset, template)
+        train_dataset = LazyLLMDataset(train_dataset, template.encode)
         if val_dataset is not None:
-            val_dataset = LazyLLMDataset(val_dataset, template)
-    if val_dataset is None:
-        training_args.evaluation_strategy = IntervalStrategy.NO
-        training_args.eval_strategy = IntervalStrategy.NO
-        training_args.do_eval = False
+            val_dataset = LazyLLMDataset(val_dataset, template.encode)
+    if isinstance(msg, dict):
+        msg['dataset_info'] = dataset_info
+    return train_dataset, val_dataset
 
+
+def trainer_train(args,
+                  model,
+                  template,
+                  train_dataset,
+                  val_dataset,
+                  callbacks=None,
+                  msg=None,
+                  ref_model=None) -> Dict[str, Any]:
+    if msg is None:
+        msg = {}
+    training_args = args.training_args
     padding_to = args.max_length if args.sft_type == 'longlora' else None
+    tokenizer = template.tokenizer
     data_collator = partial(template.data_collator, padding_to=padding_to)
 
-    train_batch_size = args.batch_size
-    eval_batch_size = args.eval_batch_size
     if use_torchacc():
+        train_batch_size = args.batch_size
+        eval_batch_size = args.eval_batch_size
         train_batch_size *= args.world_size
         eval_batch_size *= args.world_size
         training_args.per_device_train_batch_size = train_batch_size
         training_args.per_device_eval_batch_size = eval_batch_size
         training_args.group_by_length = use_torchacc()
 
-    # Trainer
     logger.info(f'training_args: {training_args}')
 
-    trainer_kwargs = {}
+    trainer_cls, trainer_kwargs = TrainerFactory.get_trainer_info(args)
     if not hasattr(model.config, 'is_encoder_decoder'):
         model.config.is_encoder_decoder = False
     is_encoder_decoder = model.config.is_encoder_decoder
     trainer_kwargs['is_encoder_decoder'] = is_encoder_decoder
-
-    if args.predict_with_generate:
+    if args.check_model_is_latest is False:
+        trainer_kwargs['check_model'] = False
+    if isinstance(args, RLHFArguments):
+        trainer_kwargs['ref_model'] = ref_model
+    elif args.predict_with_generate:
         trainer_kwargs['compute_metrics'] = partial(compute_nlg_metrics, tokenizer=tokenizer)
     else:
         compute_metrics = partial(
             compute_acc_metrics, acc_strategy=args.acc_strategy, is_encoder_decoder=is_encoder_decoder)
         trainer_kwargs['compute_metrics'] = compute_metrics
         trainer_kwargs['preprocess_logits_for_metrics'] = preprocess_logits_for_metrics
-    if args.check_model_is_latest is False:
-        trainer_kwargs['check_model'] = False
 
-    trainer = Seq2SeqTrainer(
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         data_collator=data_collator,
@@ -365,12 +438,12 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
         callbacks=callbacks,
-        sequence_parallel_size=args.sequence_parallel_size,
         **trainer_kwargs)
+    trainer.is_multimodal = args.is_multimodal
     trainer.sft_args = args
     if use_torchacc():
-        trainer.label_names = label_names
-        trainer.can_return_loss = return_loss
+        trainer.label_names = model.label_names
+        trainer.can_return_loss = model.return_loss
     if is_master():
         for args_obj, fname in zip([args, training_args], ['sft_args.json', 'training_args.json']):
             fpath = os.path.join(args.output_dir, fname)
@@ -379,33 +452,33 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
                 json.dump(check_json_format(args_obj.__dict__), f, ensure_ascii=False, indent=2)
     logging_path = os.path.join(args.output_dir, 'logging.jsonl')
     logger.info(f'The logging file will be saved in: {logging_path}')
-    trainer.train(training_args.resume_from_checkpoint)
+    with template.training_context():
+        trainer.train(training_args.resume_from_checkpoint)
     last_model_checkpoint = getattr(trainer.state, 'last_model_checkpoint', None)
     logger.info(f'last_model_checkpoint: {last_model_checkpoint}')
     logger.info(f'best_model_checkpoint: {trainer.state.best_model_checkpoint}')
-    train_time = get_time_info(trainer.state.log_history, len(train_dataset))
     # Visualization
     if is_master() and not use_torchacc():
-        if 'tensorboard' in args.training_args.report_to:
+        if 'tensorboard' in training_args.report_to:
             images_dir = os.path.join(args.output_dir, 'images')
             logger.info(f'images_dir: {images_dir}')
             plot_images(images_dir, args.logging_dir, ['train/loss'], 0.9)
         if args.push_to_hub:
-            trainer._add_patterns_to_gitignore(['images/'])
             trainer.push_to_hub()
     run_info = {
         'memory': trainer.perf['memory'],
-        'train_time': train_time,
         'last_model_checkpoint': last_model_checkpoint,
         'best_model_checkpoint': trainer.state.best_model_checkpoint,
         'best_metric': trainer.state.best_metric,
         'global_step': trainer.state.global_step,
         'log_history': trainer.state.log_history,
-        'model_info': model_info,
-        'dataset_info': dataset_info,
+        **msg
     }
+    if not args.streaming:
+        train_time = get_time_info(trainer.state.log_history, len(train_dataset))
+        run_info.update({'train_time': train_time})
     for key in ['gen_time', 'gen_len']:
-        if trainer.perf[key] != 0:
+        if key in trainer.perf and trainer.perf[key] != 0:
             run_info[key] = trainer.perf[key]
     if is_master():
         jsonl_path = os.path.join(args.output_dir, 'logging.jsonl')
@@ -413,13 +486,40 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
     return run_info
 
 
+def llm_sft(args: SftArguments) -> Dict[str, Any]:
+    logger.info(f'args: {args}')
+    seed_everything(args.seed)
+
+    is_generation = TEMPLATE_MAPPING[args.template_type].get('is_generation', False)
+    if is_generation and type(args) is SftArguments:
+        logger.warning(f"Please check if args.template_type: '{args.template_type}' is correct. "
+                       'Currently, SFT is in progress, but the template is used for PT.')
+    elif not is_generation and type(args) is PtArguments:
+        logger.warning(f"Please check if args.template_type: '{args.template_type}' is correct. "
+                       'Currently, PT is in progress, but the template is used for SFT.')
+
+    if args.train_backend == 'megatron':
+        return llm_sft_megatron(args)
+    msg = {}
+    model, template, callbacks = prepare_train_model_template(args, msg)
+    train_dataset, val_dataset = prepare_dataset(args, template, msg)
+    return trainer_train(args, model, template, train_dataset, val_dataset, callbacks=callbacks, msg=msg)
+
+
 def get_sft_main(args, llm):
     if use_torchacc():
-        logger.warning('TorchAcc is currently only available internally within Alibaba Cloud.')
         import torchacc as ta
-        # This patch should be called before `llm_sft`.
-        ta.accelerate_hf_trainer()
+        import torch_xla.runtime as xr
+        xla_cache_path = os.getenv('TORCHACC_CACHE_PATH')
+        read_only = strtobool(os.getenv('TORCHACC_CACHE_PATH_READ_ONLY', '0'))
+        suffix = f'_rank{xr.global_ordinal()}'
+        if xla_cache_path and not xla_cache_path.endswith(suffix):
+            xr.initialize_cache(xla_cache_path + suffix, readonly=read_only)
+        if version.parse(transformers.__version__) < version.parse('4.41.0'):
+            # This patch should be called before `llm_sft`.
+            ta.accelerate_hf_trainer()
     return get_main(args, llm)
 
 
 sft_main = get_sft_main(SftArguments, llm_sft)
+pt_main = get_sft_main(PtArguments, llm_sft)

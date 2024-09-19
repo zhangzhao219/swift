@@ -14,14 +14,18 @@ from requests.exceptions import HTTPError
 
 from .protocol import (ChatCompletionResponse, ChatCompletionStreamResponse, CompletionResponse,
                        CompletionStreamResponse, ModelList, XRequestConfig)
-from .template import TEMPLATE_MAPPING, History
+from .template import History
 from .utils import Messages, history_to_messages
 
 
 def _get_request_kwargs(api_key: Optional[str] = None) -> Dict[str, Any]:
-    if api_key is None:
-        return {}
-    return {'headers': {'Authorization': f'Bearer {api_key}'}}
+    timeout = float(os.getenv('TIMEOUT', '300'))
+    request_kwargs = {}
+    if timeout > 0:
+        request_kwargs['timeout'] = timeout
+    if api_key is not None:
+        request_kwargs['headers'] = {'Authorization': f'Bearer {api_key}'}
+    return request_kwargs
 
 
 def get_model_list_client(host: str = '127.0.0.1', port: str = '8000', api_key: str = 'EMPTY', **kwargs) -> ModelList:
@@ -34,6 +38,21 @@ def get_model_list_client(host: str = '127.0.0.1', port: str = '8000', api_key: 
     return from_dict(ModelList, resp_obj)
 
 
+async def get_model_list_client_async(host: str = '127.0.0.1',
+                                      port: str = '8000',
+                                      api_key: str = 'EMPTY',
+                                      **kwargs) -> ModelList:
+    url = kwargs.pop('url', None)
+    if url is None:
+        url = f'http://{host}:{port}/v1'
+    url = url.rstrip('/')
+    url = f'{url}/models'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, **_get_request_kwargs(api_key)) as resp:
+            resp_obj = await resp.json()
+    return from_dict(ModelList, resp_obj)
+
+
 def _parse_stream_data(data: bytes) -> Optional[str]:
     data = data.decode(encoding='utf-8')
     data = data.strip()
@@ -43,16 +62,26 @@ def _parse_stream_data(data: bytes) -> Optional[str]:
     return data[5:].strip()
 
 
-def _to_base64(img_path: str) -> str:
-    if not os.path.isfile(img_path):
+def _to_base64(img_path: Union[str, 'PIL.Image.Image', bytes]) -> str:
+    if isinstance(img_path, str) and not os.path.isfile(img_path):
+        # base64
         return img_path
-    with open(img_path, 'rb') as f:
-        img_base64: str = base64.b64encode(f.read()).decode('utf-8')
+    if isinstance(img_path, str):
+        # local_path
+        with open(img_path, 'rb') as f:
+            _bytes = f.read()
+    elif not isinstance(img_path, bytes):  # PIL.Image.Image
+        bytes_io = BytesIO()
+        img_path.save(bytes_io, format='png')
+        _bytes = bytes_io.getvalue()
+    else:
+        _bytes = img_path
+    img_base64: str = base64.b64encode(_bytes).decode('utf-8')
     return img_base64
 
 
 def _encode_prompt(prompt: str) -> str:
-    pattern = r'<(?:img|audio)>(.+?)</(?:img|audio)>'
+    pattern = r'<(?:img|audio|video)>(.+?)</(?:img|audio|video)>'
     match_iter = re.finditer(pattern, prompt)
     new_prompt = ''
     idx = 0
@@ -66,20 +95,22 @@ def _encode_prompt(prompt: str) -> str:
     return new_prompt
 
 
-def _from_base64(img_base64: str, tmp_dir: str) -> str:
+def _from_base64(img_base64: Union[str, 'PIL.Image.Image'], tmp_dir: str = 'tmp') -> str:
     from PIL import Image
+    if not isinstance(img_base64, str):  # PIL.Image.Image
+        img_base64 = _to_base64(img_base64)
     if os.path.isfile(img_base64) or img_base64.startswith('http'):
         return img_base64
-    img_base64: bytes = img_base64.encode('utf-8')
-    sha256_hash = hashlib.sha256(img_base64).hexdigest()
+    sha256_hash = hashlib.sha256(img_base64.encode('utf-8')).hexdigest()
     img_path = os.path.join(tmp_dir, f'{sha256_hash}.png')
     image = Image.open(BytesIO(base64.b64decode(img_base64)))
-    image.save(img_path)
+    if not os.path.exists(img_path):
+        image.save(img_path)
     return img_path
 
 
-def _decode_prompt(prompt: str, tmp_dir: str) -> str:
-    pattern = r'<(?:img|audio)>(.+?)</(?:img|audio)>'
+def _decode_prompt(prompt: str, tmp_dir: str = 'tmp') -> str:
+    pattern = r'<(?:img|audio|video)>(.+?)</(?:img|audio|video)>'
     match_iter = re.finditer(pattern, prompt)
     new_content = ''
     idx = 0
@@ -122,6 +153,7 @@ def decode_base64(*,
                   prompt: Optional[str] = None,
                   images: Optional[List[str]] = None,
                   tmp_dir: str = 'tmp') -> Dict[str, Any]:
+    # base64 -> local_path
     os.makedirs(tmp_dir, exist_ok=True)
     res = {}
     if messages is not None:
@@ -143,8 +175,7 @@ def decode_base64(*,
     return res
 
 
-def compat_openai(messages: Messages, images: List[str], template_type: str) -> None:
-    infer_media_type = TEMPLATE_MAPPING[template_type].get('infer_media_type', 'interleave')
+def compat_openai(messages: Messages, request) -> None:
     for message in messages:
         content = message['content']
         if isinstance(content, list):
@@ -154,16 +185,21 @@ def compat_openai(messages: Messages, images: List[str], template_type: str) -> 
                 value = line[_type]
                 if _type == 'text':
                     text += value
-                elif _type == 'image_url':
+                elif _type in {'image_url', 'audio_url', 'video_url'}:
                     value = value['url']
                     if value.startswith('data:'):
                         match_ = re.match(r'data:(.+?);base64,(.+)', value)
                         assert match_ is not None
                         value = match_.group(2)
-                    if infer_media_type == 'interleave':
-                        text += f'<img>{value}</img>'
+                    if _type == 'image_url':
+                        text += '<image>'
+                        request.images.append(value)
+                    elif _type == 'audio_url':
+                        text += '<audio>'
+                        request.audios.append(value)
                     else:
-                        images.append(value)
+                        text += '<video>'
+                        request.videos.append(value)
                 else:
                     raise ValueError(f'line: {line}')
             message['content'] = text
@@ -177,28 +213,30 @@ def _pre_inference_client(model_type: str,
                           tools: Optional[List[Dict[str, Union[str, Dict]]]] = None,
                           tool_choice: Optional[Union[str, Dict]] = 'auto',
                           *,
+                          model_list: Optional[ModelList] = None,
                           is_chat_request: Optional[bool] = None,
+                          is_multimodal: Optional[bool] = None,
                           request_config: Optional[XRequestConfig] = None,
                           host: str = '127.0.0.1',
                           port: str = '8000',
-                          api_key: str = 'EMPTY',
                           **kwargs) -> Tuple[str, Dict[str, Any], bool]:
-    if images is None:
-        images = []
-    model_list = get_model_list_client(host, port, **kwargs)
-    for model in model_list.data:
-        if model_type == model.id:
-            _is_chat = model.is_chat
-            is_multimodal = model.is_multimodal
-            break
-    else:
-        raise ValueError(f'model_type: {model_type}, model_list: {[model.id for model in model_list.data]}')
-
-    if is_chat_request is None:
-        is_chat_request = _is_chat
-    assert is_chat_request is not None, (
-        'Please set the `is_chat_request` parameter to indicate whether the model is a chat model.')
-    data = {k: v for k, v in request_config.__dict__.items() if not k.startswith('__')}
+    if model_list is not None:
+        for model in model_list.data:
+            if model_type == model.id:
+                if is_chat_request is None:
+                    is_chat_request = model.is_chat
+                if is_multimodal is None:
+                    is_multimodal = model.is_multimodal
+                break
+        else:
+            raise ValueError(f'model_type: {model_type}, model_list: {[model.id for model in model_list.data]}')
+    assert is_chat_request is not None and is_multimodal is not None
+    data = {}
+    request_config_origin = XRequestConfig()
+    for k, v in request_config.__dict__.items():
+        v_origin = getattr(request_config_origin, k)
+        if v != v_origin:
+            data[k] = v
     url = kwargs.pop('url', None)
     if url is None:
         url = f'http://{host}:{port}/v1'
@@ -207,7 +245,6 @@ def _pre_inference_client(model_type: str,
         messages = history_to_messages(history, query, system, kwargs.get('roles'))
         if is_multimodal:
             messages = convert_to_base64(messages=messages)['messages']
-            images = convert_to_base64(images=images)['images']
         data['messages'] = messages
         url = f'{url}/chat/completions'
     else:
@@ -215,15 +252,16 @@ def _pre_inference_client(model_type: str,
             'The chat template for text generation does not support system and history.')
         if is_multimodal:
             query = convert_to_base64(prompt=query)['prompt']
-            images = convert_to_base64(images=images)['images']
         data['prompt'] = query
         url = f'{url}/completions'
     data['model'] = model_type
-    if len(images) > 0:
-        data['images'] = images
-    if tools and len(tools) > 0:
+    for media_key, medias in zip(['images', 'audios', 'videos'], [images, kwargs.get('audios'), kwargs.get('videos')]):
+        if medias:
+            medias = convert_to_base64(images=medias)['images']
+            data[media_key] = medias
+    if tools:
         data['tools'] = tools
-    if tool_choice:
+    if tool_choice and tool_choice != 'auto':
         data['tool_choice'] = tool_choice
     return url, data, is_chat_request
 
@@ -238,6 +276,7 @@ def inference_client(
     tool_choice: Optional[Union[str, Dict]] = 'auto',
     *,
     is_chat_request: Optional[bool] = None,
+    is_multimodal: Optional[bool] = None,
     request_config: Optional[XRequestConfig] = None,
     host: str = '127.0.0.1',
     port: str = '8000',
@@ -247,6 +286,11 @@ def inference_client(
            Iterator[CompletionStreamResponse]]:
     if request_config is None:
         request_config = XRequestConfig()
+    model_list = None
+    is_chat_request = is_chat_request or kwargs.get('is_chat')
+    if is_chat_request is None or is_multimodal is None:
+        model_list = get_model_list_client(host, port, api_key=api_key, **kwargs)
+
     url, data, is_chat_request = _pre_inference_client(
         model_type,
         query,
@@ -255,11 +299,12 @@ def inference_client(
         images,
         tools,
         tool_choice,
+        model_list=model_list,
         is_chat_request=is_chat_request,
+        is_multimodal=is_multimodal,
         request_config=request_config,
         host=host,
         port=port,
-        api_key=api_key,
         **kwargs)
 
     if request_config.stream:
@@ -302,6 +347,7 @@ async def inference_client_async(
     tool_choice: Optional[Union[str, Dict]] = 'auto',
     *,
     is_chat_request: Optional[bool] = None,
+    is_multimodal: Optional[bool] = None,
     request_config: Optional[XRequestConfig] = None,
     host: str = '127.0.0.1',
     port: str = '8000',
@@ -311,6 +357,11 @@ async def inference_client_async(
            AsyncIterator[CompletionStreamResponse]]:
     if request_config is None:
         request_config = XRequestConfig()
+    model_list = None
+    is_chat_request = is_chat_request or kwargs.get('is_chat')
+    if is_chat_request is None or is_multimodal is None:
+        model_list = await get_model_list_client_async(host, port, api_key=api_key, **kwargs)
+
     url, data, is_chat_request = _pre_inference_client(
         model_type,
         query,
@@ -319,11 +370,12 @@ async def inference_client_async(
         images,
         tools,
         tool_choice,
+        model_list=model_list,
         is_chat_request=is_chat_request,
+        is_multimodal=is_multimodal,
         request_config=request_config,
         host=host,
         port=port,
-        api_key=api_key,
         **kwargs)
 
     if request_config.stream:

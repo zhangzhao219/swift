@@ -1,21 +1,17 @@
 ## LLM Documentation
 
+[中文文档](https://swift.readthedocs.io/zh-cn/latest/LLM/index.html)
+
 ### 📚Tutorials!
 
-1. [LLM Inference](LLM-inference.md)
-2. [LLM Finetuning](LLM-fine-tuning.md)
-3. [LRHF Training](Human-Preference-Alignment-Training-Documentation.md)
-4. [Web-UI Training and Inference](../GetStarted/Web-ui.md)
-5. [LLM Evaluation](LLM-eval.md)
-6. [LLM Quantization](LLM-quantization.md)
-7. [VLLM Inference and Deployment](VLLM-inference-acceleration-and-deployment.md)
-8. [LmDeploy Inference and Deployment](LmDeploy-inference-acceleration-and-deployment.md)
-9. [LLM Experimental](LLM-exp.md)
-10. [DPO Training](DPO.md)
-11. [ORPO Training](ORPO.md)
-12. [SimPO Training](SimPO.md)
-13. [Human Preference Alignment Training Documentation](Human-Preference-Alignment-Training-Documentation.md)
-14. [Megatron-training](Megatron-training.md)
+1. [LRHF Training](Human-Preference-Alignment-Training-Documentation.md)
+2. [DPO Training](DPO.md)
+3. [ORPO Training](ORPO.md)
+4. [SimPO Training](SimPO.md)
+5. [OLLAMA Export](./OLLaMA-Export.md)
+6. [VLLM Inference and Deployment](VLLM-inference-acceleration-and-deployment.md)
+7. [LmDeploy Inference and Deployment](LmDeploy-inference-acceleration-and-deployment.md)
+8. [Megatron-training](Megatron-training.md)
 
 ### ⭐️Best Practices!
 
@@ -28,11 +24,8 @@
 
 
 ### 🐔References！
-1. [Customization for models and datasets](Customization.md)
-2. [Command Line Parameters](Command-line-parameters.md)
-3. [Supported models and datasets](Supported-models-datasets.md)
-4. [Benchmark](Benchmark.md)
-5. [Compatible with the HuggingFace ecosystem](Compat-HF.md)
+1. [Benchmark](Benchmark.md)
+2. [Compatible with the HuggingFace ecosystem](Compat-HF.md)
 
 ### 🍀Multi-Modal Best Practices!
 

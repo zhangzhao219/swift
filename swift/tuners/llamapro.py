@@ -1,13 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 from torch import nn
 
 from swift.utils.logger import get_logger
-from .module_mapping import MODEL_KEYS_MAPPING, ModelKeys
+from swift.utils.module_mapping import MODEL_KEYS_MAPPING, ModelKeys
 from .utils import ActivationMixin, SwiftAdapter, SwiftConfig, SwiftOutput
 
 logger = get_logger()
@@ -78,7 +78,7 @@ class LLaMAPro(SwiftAdapter):
         LLaMAPro._set_module_list(config, model, new_module_list)
 
         def state_dict_callback(state_dict, adapter_name):
-            model_key_mapping = LLaMAPro._get_model_key_mapping(config.model_type, config)
+            model_key_mapping = LLaMAPro.get_model_key_mapping(config.model_type, config)
             new_module_list = [model_key_mapping.module_list + f'.{i}' for i in new_module_idx]
             return {
                 key: value
@@ -86,43 +86,26 @@ class LLaMAPro(SwiftAdapter):
             }
 
         def mark_trainable_callback(model):
-            model_key_mapping = LLaMAPro._get_model_key_mapping(config.model_type, config)
+            model_key_mapping = LLaMAPro.get_model_key_mapping(config.model_type, config)
             new_module_list = [model_key_mapping.module_list + f'.{i}' for i in new_module_idx]
             for name, parameter in model.named_parameters():
                 parameter: nn.Parameter
                 if any([m_part in name for m_part in new_module_list]):
                     parameter.requires_grad = True
 
-        return SwiftOutput(config, state_dict_callback, mark_trainable_callback)
-
-    @staticmethod
-    def _get_model_key_mapping(model_type, config) -> ModelKeys:
-        if model_type in MODEL_KEYS_MAPPING.keys():
-            model_key_mapping = MODEL_KEYS_MAPPING[model_type]
-        else:
-            model_key_mapping = config.model_key_mapping
-
-        if model_key_mapping is None:
-            raise ValueError(f'{model_type} is not defined in MODEL_KEYS_MAPPING, '
-                             f'please consider pass the information through the config.model_key_mapping')
-
-        if isinstance(model_key_mapping, dict):
-            model_key_mapping: ModelKeys = ModelKeys(**model_key_mapping)
-
-        assert model_key_mapping.o_proj is not None and model_key_mapping.down_proj is not None, \
-            'LLaMAPro only support models with o_proj and down_proj components.'
-        return model_key_mapping
+        return SwiftOutput(
+            config=config, state_dict_callback=state_dict_callback, mark_trainable_callback=mark_trainable_callback)
 
     @staticmethod
     def _update_module_attr(config: LLaMAProConfig, module_list):
         model_type = config.model_type
-        model_key_mapping = LLaMAPro._get_model_key_mapping(model_type, config)
+        model_key_mapping = LLaMAPro.get_model_key_mapping(model_type, config)
         attention = model_key_mapping.attention
         attention = attention.split('{}.')[1]
         if model_type == 'phi3-small':
             raise ValueError('phi3-small does not support llamapro currently')
         if model_type in ('llama', 'mistral', 'qwen2', 'yi', 'gemma', 'deepseek', 'openbuddy', 'xverse', 'orion',
-                          'bluelm', 'ziya', 'skywork', 'deepseek-v2', 'minicpm', 'phi3'):
+                          'bluelm', 'ziya', 'skywork', 'deepseek-v2', 'minicpm', 'phi3', 'internlm2'):
             for idx, module in enumerate(module_list):
                 getattr(module, attention).layer_idx = idx
         elif model_type in ('chatglm', 'glm4'):
@@ -131,10 +114,29 @@ class LLaMAPro(SwiftAdapter):
         elif model_type in ('phi2', ):
             for idx, module in enumerate(module_list):
                 getattr(module, attention).block_idx = idx
+        else:
+            for idx, module in enumerate(module_list):
+                attrs = [
+                    attr for attr in dir(getattr(module_list[0], attention))
+                    if attr in ('layer_idx', 'layer_number', 'block_idx')
+                ]
+                assert len(attrs) <= 1
+                if attrs:
+                    setattr(getattr(module, attention), attrs[0], idx)
+                else:
+                    logger.warn(f'model_type: {model_type} seems has no layer_idx, if you encountered anything wrong,'
+                                f'please give us a feedback.')
+
+    @classmethod
+    def get_model_key_mapping(cls, model_type, config) -> ModelKeys:
+        model_key_mapping = SwiftAdapter.get_model_key_mapping(model_type, config)
+        assert model_key_mapping.o_proj is not None and model_key_mapping.down_proj is not None, \
+            'LLaMAPro only support models with o_proj and down_proj components.'
+        return model_key_mapping
 
     @staticmethod
     def _update_module_weight(config: LLaMAProConfig, module_list, new_module_idx):
-        model_key_mapping = LLaMAPro._get_model_key_mapping(config.model_type, config)
+        model_key_mapping = LLaMAPro.get_model_key_mapping(config.model_type, config)
         o_proj = model_key_mapping.o_proj.split('{}.')[1]
         down_proj = model_key_mapping.down_proj.split('{}.')[1]
 
@@ -152,14 +154,14 @@ class LLaMAPro(SwiftAdapter):
 
     @staticmethod
     def _set_module_list(config, module: nn.Module, module_list: nn.ModuleList):
-        model_key_mapping = LLaMAPro._get_model_key_mapping(config.model_type, config)
+        model_key_mapping = LLaMAPro.get_model_key_mapping(config.model_type, config)
         idx = model_key_mapping.module_list.rfind('.')
         parent = module.get_submodule(model_key_mapping.module_list[:idx])
         setattr(parent, model_key_mapping.module_list[idx + 1:], module_list)
 
     @staticmethod
     def _find_module_list(config, module: nn.Module) -> nn.ModuleList:
-        model_key_mapping = LLaMAPro._get_model_key_mapping(config.model_type, config)
+        model_key_mapping = LLaMAPro.get_model_key_mapping(config.model_type, config)
         return module.get_submodule(model_key_mapping.module_list)
 
     @staticmethod

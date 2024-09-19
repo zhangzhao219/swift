@@ -4,15 +4,18 @@ import datetime as dt
 import multiprocessing
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import json
-from llmuses.config import TaskConfig
-from llmuses.constants import DEFAULT_ROOT_CACHE_DIR
-from llmuses.models.custom import CustomModel
-from llmuses.run import run_task
-from llmuses.summarizer import Summarizer
-from llmuses.utils import EvalBackend
+from evalscope.backend.opencompass import OpenCompassBackendManager
+from evalscope.backend.vlm_eval_kit import VLMEvalKitBackendManager
+from evalscope.config import TaskConfig
+from evalscope.constants import DEFAULT_ROOT_CACHE_DIR
+from evalscope.models.custom import CustomModel
+from evalscope.run import run_task
+from evalscope.summarizer import Summarizer
+from evalscope.utils import EvalBackend
 from modelscope import GenerationConfig
 from openai import APIConnectionError
 from tqdm import tqdm
@@ -134,16 +137,17 @@ class EvalModel(CustomModel):
 
 
 def run_custom_model(args: EvalArguments):
-    from swift.llm.deploy import llm_deploy
+    from swift.llm import deploy_main
     port = args.port
     args = args.__dict__
     attrs = dir(DeployArguments)
     for key in list(args.keys()):
         if key not in attrs:
             args.pop(key)
+    args['verbose'] = False
     deploy_args = DeployArguments(**args)
     deploy_args.port = port
-    llm_deploy(deploy_args)
+    deploy_main(deploy_args)
 
 
 class EvalDatasetContext:
@@ -190,40 +194,7 @@ def get_model_type(port, timeout):
                 time.sleep(1)
 
 
-def eval_opencompass(args: EvalArguments) -> List[Dict[str, Any]]:
-    from llmuses.run import run_task
-    from swift.utils.torch_utils import _find_free_port
-    logger.info(f'args: {args}')
-    if args.eval_few_shot:
-        logger.warn('OpenCompass does not support `eval_few_shot`')
-    process = None
-    if not args.eval_url:
-        seed_everything(args.seed)
-        port = _find_free_port()
-        args.port = port
-        mp = multiprocessing.get_context('spawn')
-        process = mp.Process(target=run_custom_model, args=(args, ))
-        process.start()
-
-        # health check: try to get model_type until raises
-        get_model_type(port, args.deploy_timeout)
-        model_type = 'default-lora' if args.sft_type in ('lora',
-                                                         'longlora') and not args.merge_lora else args.model_type
-        from .deploy import is_generation_template
-        if is_generation_template(args.template_type):
-            url = f'http://127.0.0.1:{port}/v1/completions'
-        else:
-            url = f'http://127.0.0.1:{port}/v1/chat/completions'
-        is_chat = not is_generation_template(args.template_type)
-    else:
-        url = args.eval_url
-        url = url.rstrip('/')
-        if args.eval_is_chat_model:
-            url += '/chat/completions'
-        else:
-            url += '/completions'
-        model_type = args.model_type
-        is_chat = args.eval_is_chat_model
+def opencompass_runner(args: EvalArguments, dataset: List[str], model_type: str, is_chat: bool, url: str):
     eval_limit = args.eval_limit
     if eval_limit is not None and '[' not in eval_limit:
         eval_limit = int(eval_limit)
@@ -231,35 +202,127 @@ def eval_opencompass(args: EvalArguments) -> List[Dict[str, Any]]:
     task_cfg = dict(
         eval_backend='OpenCompass',
         eval_config={
-            'datasets': args.eval_dataset,
-            'work_dir': args.eval_output_dir,
-            'reuse': 'latest' if args.eval_use_cache else None,
-            'batch_size': args.eval_batch_size,
+            'datasets':
+            dataset,
+            'reuse':
+            'latest' if args.eval_use_cache else None,
+            'batch_size':
+            args.eval_batch_size,
+            'work_dir':
+            args.eval_output_dir,
             'models': [
                 {
                     'path': model_type,
                     'openai_api_base': url,
                     'is_chat': is_chat,
                     'key': args.eval_token,
+                    'temperature': args.temperature
                 },
             ],
-            **limit_config
+            **limit_config,
         },
     )
-
     with EvalDatasetContext():
         run_task(task_cfg=task_cfg)
 
-    final_report: List[dict] = Summarizer.get_report_from_cfg(task_cfg=task_cfg)
-    logger.info(f'Final report:{final_report}\n')
-    if process:
-        process.kill()
+    return Summarizer.get_report_from_cfg(task_cfg=task_cfg)
+
+
+def vlmeval_runner(args: EvalArguments, dataset: List[str], model_type: str, is_chat: bool, url: str):
+    eval_limit = args.eval_limit
+    if eval_limit is not None and '[' not in eval_limit:
+        eval_limit = int(eval_limit)
+    limit_config = {'limit': eval_limit} if eval_limit else {}
+    if args.eval_batch_size or args.eval_use_cache:
+        logger.warn('VLMEval does not support `eval_batch_size` or `eval_use_cache`')
+    task_cfg = dict(
+        eval_backend='VLMEvalKit',
+        eval_config={
+            'data':
+            dataset,
+            'work_dir':
+            args.eval_output_dir,
+            'model': [
+                {
+                    'name': 'CustomAPIModel',
+                    'api_base': url,
+                    'key': args.eval_token,
+                    'type': model_type,
+                    'temperature': args.temperature
+                },
+            ],
+            **limit_config,
+            'nproc':
+            args.eval_nproc,
+        },
+    )
+    run_task(task_cfg=task_cfg)
+    return Summarizer.get_report_from_cfg(task_cfg=task_cfg)
+
+
+@contextmanager
+def deploy_context(args):
+    from swift.utils.torch_utils import _find_free_port
+    process = None
+    try:
+        if not args.eval_url:
+            port = _find_free_port()
+            args.port = port
+            mp = multiprocessing.get_context('spawn')
+            process = mp.Process(target=run_custom_model, args=(args, ))
+            process.start()
+        yield
+    finally:
+        if process is not None:
+            process.kill()
+            process.join()
+            logger.info('The deployment process has been terminated.')
+
+
+def eval_opencompass(args: EvalArguments) -> List[Dict[str, Any]]:
+    logger.info(f'args: {args}')
+    if args.eval_few_shot:
+        logger.warn('OpenCompass does not support `eval_few_shot`')
+    with deploy_context(args):
+        if not args.eval_url:
+            port = args.port
+            # health check: try to get model_type until raises
+            get_model_type(port, args.deploy_timeout)
+            model_type = 'default-lora' if args.sft_type in ('lora',
+                                                             'longlora') and not args.merge_lora else args.model_type
+            from .deploy import is_generation_template
+            if is_generation_template(args.template_type):
+                url = f'http://127.0.0.1:{port}/v1/completions'
+            else:
+                url = f'http://127.0.0.1:{port}/v1/chat/completions'
+            is_chat = not is_generation_template(args.template_type)
+        else:
+            url = args.eval_url
+            url = url.rstrip('/')
+            if args.eval_is_chat_model:
+                url += '/chat/completions'
+            else:
+                url += '/completions'
+            model_type = args.model_type
+            is_chat = args.eval_is_chat_model
+
+        nlp_datasets = set(OpenCompassBackendManager.list_datasets()) & set(args.eval_dataset)
+        mm_datasets = set(VLMEvalKitBackendManager.list_supported_datasets()) & set(args.eval_dataset)
+
+        final_report = []
+        for dataset, runner in zip([list(nlp_datasets), list(mm_datasets)], [opencompass_runner, vlmeval_runner]):
+            if not dataset:
+                continue
+
+            report = runner(args, dataset, model_type, is_chat, url)
+            logger.info(f'Final report:{report}\n')
+            final_report.extend(report)
+    if not final_report:
+        raise ValueError(f'Cannot load final report, please check your dataset: {args.eval_dataset} and the eval log')
     return final_report
 
 
 def eval_llmuses(args: EvalArguments) -> List[Dict[str, Any]]:
-    logger.info(f'args: {args}')
-    seed_everything(args.seed)
     model_name = args.model_type
     tm = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
     model_name += f'-{args.name or tm}'
@@ -273,8 +336,19 @@ def eval_llmuses(args: EvalArguments) -> List[Dict[str, Any]]:
                 TaskConfig.registry(_ds['name'], _ds['pattern'], _ds['dataset'], subset_list=_ds.get('subset_list'))
     eval_model = EvalModel(args, model_name)
 
+    generation_config = {
+        'do_sample': args.do_sample,
+        'repetition_penalty': args.repetition_penalty,
+        'max_length': args.max_length,
+        'max_new_tokens': args.max_new_tokens,
+        'temperature': args.temperature,
+        'top_k': args.top_k,
+        'top_p': args.top_p,
+    }
+
     task_configs = TaskConfig.load(custom_model=eval_model, tasks=args.eval_dataset + custom_names)
     for task_config in task_configs:
+        task_config.generation_config = generation_config
         task_config.dataset_dir = DEFAULT_ROOT_CACHE_DIR
         task_config.use_cache = args.eval_use_cache
         if args.eval_limit is not None:
@@ -311,6 +385,8 @@ def eval_llmuses(args: EvalArguments) -> List[Dict[str, Any]]:
 
 
 def llm_eval(args: EvalArguments) -> List[Dict[str, Any]]:
+    logger.info(f'args: {args}')
+    seed_everything(args.seed)
     args.eval_output_dir = os.path.join(args.eval_output_dir, args.name or 'default')
     if args.custom_eval_config:
         args.eval_backend = EvalBackend.NATIVE.value

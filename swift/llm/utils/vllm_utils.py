@@ -1,8 +1,7 @@
-import asyncio
+import concurrent.futures
 import inspect
 import os
 import time
-from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -10,15 +9,13 @@ import torch
 import vllm
 from modelscope import GenerationConfig
 from packaging import version
-from torch import dtype as Dtype
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
-from transformers.utils.versions import require_version
 from vllm import AsyncEngineArgs, AsyncLLMEngine, EngineArgs, LLMEngine, SamplingParams
 
 from swift.utils import get_logger
 from .argument import InferArguments
-from .model import MODEL_MAPPING, get_model_tokenizer
+from .model import get_model_tokenizer
 from .template import Template, get_template
 
 try:
@@ -29,33 +26,25 @@ except ImportError:
 logger = get_logger()
 
 
-@contextmanager
-def vllm_context(self: Template):
-    self._is_vllm = True
-    yield
-    self._is_vllm = False
-
-
 def get_vllm_engine(
         model_type: str,
-        torch_dtype: Optional[Dtype] = None,
+        torch_dtype: Optional[torch.dtype] = None,
         *,
         model_id_or_path: Optional[str] = None,
         revision: Optional[str] = None,
         gpu_memory_utilization: float = 0.9,
         tensor_parallel_size: int = 1,
+        max_num_seqs: int = 256,
         max_model_len: Optional[int] = None,
         disable_custom_all_reduce: bool = True,  # Default values different from vllm
         enforce_eager: bool = False,
+        limit_mm_per_prompt: Optional[Dict[str, Any]] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
         use_async: bool = False,
         # lora
         enable_lora: bool = False,
         max_loras: int = 1,
         max_lora_rank: int = 16,
-        # multimodal
-        image_input_shape: Optional[str] = None,
-        image_feature_size: Optional[int] = None,
         **kwargs) -> LLMEngine:
     model_dir = kwargs.pop('model_dir', None)  # compat with swift<1.7
     tokenizer = get_model_tokenizer(
@@ -89,24 +78,23 @@ def get_vllm_engine(
     else:
         assert not enable_lora, 'The current version of VLLM does not support `enable_lora`. Please upgrade VLLM.'
 
-    vllm_config = MODEL_MAPPING[model_type].get('vllm_config') or {}
-    if len(vllm_config) > 0:
-        require_version('vllm>=0.5')
-        if image_input_shape is not None:
-            vllm_config['image_input_shape'] = image_input_shape
-        if image_feature_size is not None:
-            vllm_config['image_feature_size'] = image_feature_size
+    if 'limit_mm_per_prompt' in parameters and limit_mm_per_prompt:
+        engine_kwargs['limit_mm_per_prompt'] = limit_mm_per_prompt
+    else:
+        assert not limit_mm_per_prompt, (
+            'The current version of VLLM does not support `limit_mm_per_prompt`. Please upgrade VLLM.')
+
     engine_args = engine_args_cls(
         model=model_dir,
         trust_remote_code=True,
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         tensor_parallel_size=tensor_parallel_size,
+        max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         disable_log_stats=disable_log_stats,
         disable_custom_all_reduce=disable_custom_all_reduce,
         enforce_eager=enforce_eager,
-        **vllm_config,
         **engine_kwargs)
     try:
         from vllm.model_executor.parallel_utils.parallel_state import destroy_model_parallel
@@ -127,10 +115,11 @@ def get_vllm_engine(
         _engine = llm_engine.engine
     else:
         _engine = llm_engine
-    llm_engine.dtype = _engine.model_config.dtype  # compat with pt
-    llm_engine.vllm_config = vllm_config
-    if len(vllm_config) > 0:
-        llm_engine.is_multimodal = True
+    model_config = _engine.model_config
+    llm_engine.model_config = model_config
+    llm_engine.dtype = model_config.dtype  # compat with pt
+    llm_engine.max_model_len = model_config.max_model_len
+    llm_engine.is_multimodal = tokenizer.is_multimodal
     # compatible with vllm==0.3.*
     if version.parse(vllm.__version__) >= version.parse('0.3'):
         assert isinstance(_engine.tokenizer.tokenizer, PreTrainedTokenizerBase)
@@ -158,9 +147,15 @@ def get_vllm_engine(
     if os.path.isfile(generation_config_path):
         generation_config = GenerationConfig.from_pretrained(model_dir)
         kwargs = generation_config.to_dict()
-        parameters = inspect.signature(VllmGenerationConfig.__init__).parameters
-        for k in kwargs.copy().keys():
-            if k not in parameters:
+        max_new_tokens = kwargs.get('max_new_tokens')
+        if max_new_tokens is not None:
+            kwargs['max_tokens'] = max_new_tokens
+        if version.parse(vllm.__version__) < version.parse('0.5.5'):
+            parameters = inspect.signature(VllmGenerationConfig.__init__).parameters
+        else:
+            parameters = VllmGenerationConfig.__annotations__
+        for k, v in kwargs.copy().items():
+            if k not in parameters or v is None:
                 kwargs.pop(k)
         llm_engine.generation_config = VllmGenerationConfig(**kwargs)
     else:
@@ -168,111 +163,130 @@ def get_vllm_engine(
     return llm_engine
 
 
-class VllmGenerationConfig(SamplingParams):
-
-    def __init__(
-        self,
-        max_new_tokens: Optional[int] = 64,  # max_tokens
-        temperature: float = 1.,
-        top_k: int = 50,  # -1: all
-        top_p: float = 1.,
-        repetition_penalty: float = 1.,
-        num_beams: int = 1,
-        *,
-        n: int = 1,
-        length_penalty: float = 1.,
-        stop: Optional[List[str]] = None,
-        skip_special_tokens: bool = False,
-        **kwargs,
-    ) -> None:
-        # The parameter design is similar to transformers.GenerationConfig.
-        if max_new_tokens is None:
-            max_new_tokens = 64
-        if num_beams > 1:
-            top_k = -1
-            top_p = 1
-            temperature = 0
-            logger.warning(
-                'The output of num_beams in vllm may not be consistent with the output of num_beams in transformers.')
-        if top_k == 0:
-            top_k = -1
-        if stop is None:
-            stop = []
-        kwargs['max_tokens'] = max_new_tokens
-        kwargs['temperature'] = temperature
-        kwargs['top_k'] = top_k
-        kwargs['top_p'] = top_p
-        kwargs['repetition_penalty'] = repetition_penalty
-        if num_beams > 1:
-            best_of = kwargs.get('best_of')
-            assert 'use_beam_search' not in kwargs and best_of is None
-            kwargs['use_beam_search'] = True
-            kwargs['best_of'] = num_beams
-        kwargs['n'] = n
-        kwargs['length_penalty'] = length_penalty
-        kwargs['stop'] = stop
-        kwargs['skip_special_tokens'] = skip_special_tokens
-        parameters = inspect.signature(SamplingParams.__init__).parameters
-        for k in kwargs.copy().keys():
-            if k not in parameters:
-                logger.info(f'The VLLM version is too old and does not support the parameter: {k}.')
-                kwargs.pop(k)
-        self._temperature = temperature
-        super().__init__(**kwargs)
+class _VllmGenerationConfigMixin:
 
     def __setattr__(self, key: str, value: str) -> None:
         if key == 'max_new_tokens':
             self.max_tokens = value
-        elif key == 'do_sample':
+        elif key == 'do_sample' and hasattr(self, '_temperature'):
             assert value in {True, False}
-            if value:
-                self.temperature = self._temperature
-            else:
-                self.temperature = 0.
+            super().__setattr__('temperature', self._temperature if value else 0)
         elif key == 'max_length':
             raise ValueError('`max_length` is not supported, please use `max_new_tokens` for setting.')
         else:
+            if key == 'temperature':
+                self._temperature = value
             super().__setattr__(key, value)
 
 
-def _patch_vllm_multimodal(image_sizes: torch.Tensor) -> None:
-    from vllm.multimodal import MultiModalPlugin
+if version.parse(vllm.__version__) < version.parse('0.5.5'):
 
-    if hasattr(MultiModalPlugin, '_old_map_input'):
-        map_input = MultiModalPlugin._old_map_input
-    else:
-        map_input = getattr(MultiModalPlugin, 'map_input', None)
-        if map_input is None:
-            map_input = MultiModalPlugin.process_input
+    class VllmGenerationConfig(_VllmGenerationConfigMixin, SamplingParams):
 
-    def new_map_input(*args, **kwargs):
-        res = map_input(*args, **kwargs)
-        res['image_sizes'] = image_sizes
-        return res
+        def __init__(
+            self,
+            max_tokens: int = 64,  # max_tokens
+            temperature: float = 1.,
+            top_k: int = 50,  # -1: all
+            top_p: float = 1.,
+            repetition_penalty: float = 1.,
+            num_beams: int = 1,
+            *,
+            n: int = 1,
+            logprobs: Optional[int] = None,
+            seed: Optional[int] = None,
+            length_penalty: float = 1.,
+            stop: Optional[List[str]] = None,
+            skip_special_tokens: bool = False,
+            **kwargs,
+        ) -> None:
+            # compat
+            max_new_tokens = kwargs.pop('max_new_tokens', None)
+            if max_new_tokens is not None:
+                max_tokens = max_new_tokens
+            if num_beams > 1:
+                top_k = -1
+                top_p = 1
+                temperature = 0
+                logger.warning('The output of num_beams in vllm may not be consistent with '
+                               'the output of num_beams in transformers.')
+            if top_k == 0:
+                top_k = -1
+            if stop is None:
+                stop = []
+            kwargs['max_tokens'] = max_tokens
+            kwargs['temperature'] = temperature
+            kwargs['top_k'] = top_k
+            kwargs['top_p'] = top_p
+            kwargs['repetition_penalty'] = repetition_penalty
+            if num_beams > 1:
+                best_of = kwargs.get('best_of')
+                assert 'use_beam_search' not in kwargs and best_of is None
+                kwargs['use_beam_search'] = True
+                kwargs['best_of'] = num_beams
+            kwargs['n'] = n
+            kwargs['logprobs'] = logprobs
+            kwargs['seed'] = seed
+            kwargs['length_penalty'] = length_penalty
+            kwargs['stop'] = stop
+            kwargs['skip_special_tokens'] = skip_special_tokens
+            parameters = inspect.signature(SamplingParams.__init__).parameters
+            for k in kwargs.copy().keys():
+                if k not in parameters:
+                    logger.info(f'The VLLM version is too old and does not support the parameter: {k}.')
+                    kwargs.pop(k)
+            self._temperature = temperature
+            super().__init__(**kwargs)
 
-    MultiModalPlugin.map_input = new_map_input
-    MultiModalPlugin.process_input = new_map_input
-    MultiModalPlugin._old_map_input = map_input
+else:
 
+    class VllmGenerationConfig(_VllmGenerationConfigMixin, SamplingParams):
+        max_tokens: int = 64
+        temperature: float = 1.
+        top_k: int = 50  # -1: all
+        top_p: float = 1.
+        repetition_penalty: float = 1.
+        num_beams: int = 1
+        n: int = 1
+        logprobs: Optional[int] = None
+        seed: Optional[int] = None
+        length_penalty: float = 1.
+        stop: Optional[List[str]] = None
+        skip_special_tokens: bool = False
 
-def _prepare_request_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    input_ids = inputs['input_ids']
-    request_inputs = {'prompt_token_ids': input_ids}
-    if 'pixel_values' in inputs:
-        from vllm.multimodal.image import ImagePixelData
-        request_inputs['multi_modal_data'] = ImagePixelData(inputs['pixel_values'])
-    if 'image_sizes' in inputs:
-        _patch_vllm_multimodal(inputs['image_sizes'])
-    return request_inputs
+        def __post_init__(self):
+            if self.num_beams > 1:
+                self.top_k = -1
+                self.top_p = 1
+                self.temperature = 0
+                logger.warning('The output of num_beams in vllm may not be consistent with '
+                               'the output of num_beams in transformers.')
+                assert self.best_of is None
+                self.use_beam_search = True
+                self.best_of = self.num_beams
+            if self.top_k == 0:
+                self.top_k = -1
+            if self.stop is None:
+                self.stop = []
+            self._temperature = self.temperature
+            super().__post_init__()
 
 
 def _add_vllm_request(llm_engine: LLMEngine, inputs: Dict[str, Any], *, request_id: str,
                       generation_config: VllmGenerationConfig, **kwargs) -> None:
+    input_ids = inputs['input_ids']
     if version.parse(vllm.__version__) >= version.parse('0.4.3'):
-        request_inputs = _prepare_request_inputs(inputs)
-        llm_engine.add_request(request_id, request_inputs, generation_config, **kwargs)
+        llm_inputs = {'prompt_token_ids': input_ids}
+        images = inputs.get('images') or []
+        if images:
+            if version.parse(vllm.__version__) < version.parse('0.6'):
+                assert len(images) == 1, (
+                    'The current version of vllm only supports single images. Please upgrade to vllm >= 0.6.0')
+                llm_inputs['multi_modal_data'] = {'image': images[0]}
+            else:
+                llm_inputs['multi_modal_data'] = {'image': images}
+        llm_engine.add_request(request_id, llm_inputs, generation_config, **kwargs)
     else:
-        input_ids = inputs['input_ids']
         llm_engine.add_request(request_id, None, generation_config, input_ids, **kwargs)
 
 
@@ -286,7 +300,8 @@ def _prepare_vllm_request(llm_engine: LLMEngine,
                           use_tqdm: bool = False,
                           **kwargs) -> Tuple[List[Optional[Dict[str, Any]]], List[Tuple[bool, int]]]:
     for key in ['num_prompt_tokens', 'num_generated_tokens', 'num_samples']:
-        generation_info[key] = 0
+        if key not in generation_info:
+            generation_info[key] = 0
 
     template.model = llm_engine
     tokenizer = template.tokenizer
@@ -310,13 +325,15 @@ def _prepare_vllm_request(llm_engine: LLMEngine,
     resp_list: List[Optional[Dict[str, Any]]] = [None] * len(request_list)
     agent_state = []
     is_multimodal = getattr(llm_engine, 'is_multimodal', False)
+    max_workers = os.cpu_count()
     if not is_multimodal:
         use_tqdm = False
-    for i, request in enumerate(tqdm(request_list, dynamic_ncols=True, disable=not use_tqdm)):
-        history = request.get('history', None)
-        if history is None:
-            history = []
+        max_workers = 1
 
+    prog_bar = tqdm(request_list, dynamic_ncols=True, disable=not use_tqdm)
+
+    def _prepare_inputs(request: Dict[str, Any]) -> Dict[str, Any]:
+        history = request.get('history') or []
         # agent support
         is_observation = history[-1][-1].endswith('Observation:') if history and history[-1][-1] else False
         act_length = None
@@ -325,14 +342,24 @@ def _prepare_vllm_request(llm_engine: LLMEngine,
             act_length = len(history[-1][-1])
             request['query'] = None
         agent_state.append((is_observation, act_length))
-
         request['history'] = history
-        with vllm_context(template):
-            inputs = template.encode(request)[0]
+
+        inputs = template.encode(request)[0]
+        prog_bar.update()
+        return inputs
+
+    with template.vllm_context(), concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, len(request_list))) as executor:
+        futures = [executor.submit(_prepare_inputs, request) for request in request_list]
+        concurrent.futures.wait(futures)
+        inputs_list = [future.result() for future in futures]
+    prog_bar.close()
+
+    for i, (inputs, request) in enumerate(zip(inputs_list, request_list)):
         truncation_strategy = kwargs.pop('truncation_strategy', 'delete')
         if len(inputs) == 0 and truncation_strategy == 'delete':
             # input_ids exceeds `max_length`. Please increase the value of `max_length`.
-            resp_list[i] = {'response': '', 'history': history}
+            resp_list[i] = {'response': '', 'history': request['history']}
             continue
         generation_info['num_prompt_tokens'] += len(inputs['input_ids'])
         generation_info['num_samples'] += 1
@@ -355,14 +382,16 @@ def inference_stream_vllm(
         **kwargs) -> Iterator[List[Dict[str, Any]]]:
     """
     request_list: e.g. [{'query': 'hello!'}].
-        The keys that can be included are: 'query', 'history', 'system'.
+        The keys that can be included are: 'query', 'history', 'system', 'images'.
     generation_config: Priority: generation_config > model.generation_config.
     return: e.g. [{'response': 'hi!', 'history': [('hello!', 'hi!')]}].
         The keys to be included will be: 'response', 'history'.
     """
+    if len(request_list) == 0:
+        return
     start_runtime = time.perf_counter()
     if generation_config is None:
-        generation_config = getattr(llm_engine, 'generation_config', VllmGenerationConfig())
+        generation_config = getattr(llm_engine, 'generation_config', None) or VllmGenerationConfig()
     assert isinstance(generation_config, VllmGenerationConfig)
     request_list = deepcopy(request_list)
     generation_config = deepcopy(generation_config)
@@ -403,6 +432,7 @@ def inference_stream_vllm(
             i = int(output.request_id)
             request = request_list[i]
             generate_ids = output.outputs[0].token_ids
+            logprobs = output.outputs[0].logprobs
             safe_response = template.generate_ids_to_response(
                 generate_ids, output.finished, print_idx=print_idx_list[i])
             query = request['query']
@@ -419,6 +449,8 @@ def inference_stream_vllm(
             num_generated_tokens[i] = n_gen_tokens
 
             resp_list[i] = {'response': safe_response, 'history': history}
+            if logprobs is not None:
+                resp_list[i]['logprobs'] = logprobs
             if output.finished:
                 n_finished += 1
                 prog_bar.update()
@@ -439,6 +471,7 @@ def inference_vllm(llm_engine: LLMEngine,
                    *,
                    generation_config: Optional[VllmGenerationConfig] = None,
                    generation_info: Optional[Dict[str, Any]] = None,
+                   max_batch_size: Optional[int] = None,
                    lora_request: Optional['LoRARequest'] = None,
                    use_tqdm: bool = False,
                    verbose: bool = False,
@@ -447,22 +480,56 @@ def inference_vllm(llm_engine: LLMEngine,
                    **kwargs) -> List[Dict[str, Any]]:
     """
     request_list: e.g. [{'query': 'hello!'}].
-        The keys that can be included are: 'query', 'history', 'system'.
+        The keys that can be included are: 'query', 'history', 'system', 'images'.
     generation_config: Priority: generation_config > model.generation_config.
     return: e.g. [{'response': 'hi!', 'history': [('hello!', 'hi!')]}].
         The keys to be included will be: 'response', 'history'.
     """
+    if len(request_list) == 0:
+        return []
     runtime = time.perf_counter()
+
+    is_multimodal = getattr(llm_engine, 'is_multimodal', False)
+    if is_multimodal and max_batch_size is None:
+        max_batch_size = 512
+
+    _inner_call = kwargs.get('_inner_call', False)
+    if generation_info is None:
+        generation_info = {}
+    elif not _inner_call:
+        generation_info.clear()
+    if max_batch_size is not None and len(request_list) > max_batch_size:
+        i = 0
+        resp_list = []
+        kwargs['_inner_call'] = True
+        while i < len(request_list):
+            resp_list += inference_vllm(
+                llm_engine,
+                template,
+                request_list[i:i + max_batch_size],
+                generation_config=generation_config,
+                generation_info=generation_info,
+                max_batch_size=max_batch_size,
+                lora_request=lora_request,
+                use_tqdm=use_tqdm,
+                verbose=verbose,
+                prompt_prefix=prompt_prefix,
+                output_prefix=output_prefix,
+                **kwargs)
+            i += max_batch_size
+        runtime = time.perf_counter() - runtime
+        generation_info['runtime'] = runtime
+        generation_info['samples/s'] = generation_info['num_samples'] / runtime
+        generation_info['tokens/s'] = generation_info['num_generated_tokens'] / runtime
+        return resp_list
+
     if generation_config is None:
-        generation_config = getattr(llm_engine, 'generation_config', VllmGenerationConfig())
+        generation_config = getattr(llm_engine, 'generation_config', None) or VllmGenerationConfig()
     assert isinstance(generation_config, VllmGenerationConfig)
     request_list = deepcopy(request_list)
     generation_config = deepcopy(generation_config)
-    if generation_info is None:
-        generation_info = {}
-    else:
-        generation_info.clear()
 
+    old_num_samples = generation_info.get('num_samples', 0)
     resp_list, agent_state = _prepare_vllm_request(
         llm_engine,
         template,
@@ -476,7 +543,7 @@ def inference_vllm(llm_engine: LLMEngine,
     tokenizer = template.tokenizer
     if use_tqdm:
         assert verbose is False
-    prog_bar = tqdm(total=generation_info['num_samples'], dynamic_ncols=True, disable=not use_tqdm)
+    prog_bar = tqdm(total=generation_info['num_samples'] - old_num_samples, dynamic_ncols=True, disable=not use_tqdm)
     outputs = []
     while llm_engine.has_unfinished_requests():
         step_outputs = llm_engine.step()
@@ -490,6 +557,7 @@ def inference_vllm(llm_engine: LLMEngine,
         i = int(output.request_id)
         request = request_list[i]
         generate_ids = output.outputs[0].token_ids
+        logprobs = output.outputs[0].logprobs
         response = template.generate_ids_to_response(generate_ids)
         query = request['query']
         history = request['history']
@@ -500,12 +568,14 @@ def inference_vllm(llm_engine: LLMEngine,
 
         generation_info['num_generated_tokens'] += sum(len(_output.token_ids) for _output in output.outputs)
         resp_list[i] = {'response': response, 'history': history}
+        if logprobs is not None:
+            resp_list[i]['logprobs'] = logprobs
         if verbose:
             print(f'{prompt_prefix}{tokenizer.decode(output.prompt_token_ids, False)}{output_prefix}', end='')
             print(tokenizer.decode(output.outputs[0].token_ids, False))
     runtime = time.perf_counter() - runtime
     generation_info['runtime'] = runtime
-    generation_info['samples/s'] = len(outputs) / runtime
+    generation_info['samples/s'] = generation_info['num_samples'] / runtime
     generation_info['tokens/s'] = generation_info['num_generated_tokens'] / runtime
     return resp_list
 
@@ -513,7 +583,6 @@ def inference_vllm(llm_engine: LLMEngine,
 def prepare_vllm_engine_template(args: InferArguments, use_async: bool = False) -> Tuple[LLMEngine, Template]:
     logger.info(f'device_count: {torch.cuda.device_count()}')
 
-    assert args.quantization_bit == 0, 'not support bnb'
     assert not (args.sft_type == 'lora' and not args.vllm_enable_lora), 'you need to merge lora'
     # Loading Model and Tokenizer
     model_id_or_path = None
@@ -526,36 +595,24 @@ def prepare_vllm_engine_template(args: InferArguments, use_async: bool = False) 
         args.torch_dtype,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
+        max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         disable_custom_all_reduce=args.disable_custom_all_reduce,
         enforce_eager=args.enforce_eager,
+        limit_mm_per_prompt=args.limit_mm_per_prompt,
         use_async=use_async,
         model_id_or_path=model_id_or_path,
         enable_lora=args.vllm_enable_lora,
-        max_loras=min(len(args.lora_modules), 1),
-        max_lora_rank=args.vllm_max_lora_rank,
-        image_input_shape=args.image_input_shape,
-        image_feature_size=args.image_feature_size)
-    tokenizer = llm_engine.hf_tokenizer
-    if use_async:
-        model_config = asyncio.run(llm_engine.get_model_config())
-        llm_engine.model_config = model_config
-    else:
-        model_config = llm_engine.model_config
-    logger.info(f'model_config: {model_config.hf_config}')
+        max_loras=max(len(args.lora_modules), 1),
+        max_lora_rank=args.vllm_max_lora_rank)
+    setattr(llm_engine.generation_config, 'max_tokens', args.max_new_tokens)
+    for k in ['temperature', 'do_sample', 'top_k', 'top_p', 'repetition_penalty']:
+        val = getattr(args, k, None)
+        if val is not None:
+            setattr(llm_engine.generation_config, k, val)
+    logger.info(f'llm_engine.generation_config: {llm_engine.generation_config}')
 
-    if not args.do_sample:
-        args.temperature = 0
-    generation_config = VllmGenerationConfig(
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        stop=args.stop_words,
-        repetition_penalty=args.repetition_penalty,
-        num_beams=args.num_beams)
-    logger.info(f'generation_config: {generation_config}')
-    llm_engine.generation_config = generation_config
+    tokenizer = llm_engine.hf_tokenizer
     template: Template = get_template(
         args.template_type,
         tokenizer,

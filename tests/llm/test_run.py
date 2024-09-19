@@ -16,7 +16,6 @@ import transformers
 from datasets import Dataset as HfDataset
 from modelscope import Model, MsDataset, snapshot_download
 from packaging import version
-from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoTokenizer
 
@@ -47,7 +46,6 @@ class TestRun(unittest.TestCase):
         output = sft_main(
             SftArguments(
                 model_type=ModelType.qwen1half_1_8b,
-                model_id_or_path='../models/Qwen1.5-1.8B',
                 template_type='qwen',
                 sft_type='full',
                 dataset=f'{DatasetName.jd_sentiment_zh}#200',
@@ -381,7 +379,7 @@ class TestRun(unittest.TestCase):
                 lazy_tokenize=False))
 
 
-def data_collate_fn(batch: List[Dict[str, Any]], tokenizer) -> Dict[str, Tensor]:
+def data_collate_fn(batch: List[Dict[str, Any]], tokenizer) -> Dict[str, torch.Tensor]:
     # text-classification
     assert tokenizer.pad_token_id is not None
     input_ids = [torch.tensor(b['input_ids']) for b in batch]
@@ -461,7 +459,7 @@ class TestTrainer(unittest.TestCase):
                 push_to_hub=push_to_hub,
                 hub_token=None,  # use env var
                 hub_private_repo=True,
-                push_hub_strategy='push_best',
+                hub_strategy='every_save',
                 hub_model_id=self.hub_model_id,
                 overwrite_output_dir=True,
                 save_steps=10,
@@ -472,6 +470,7 @@ class TestTrainer(unittest.TestCase):
                 gradient_accumulation_steps=1,
                 logging_steps=5,
                 eval_steps=10,
+                save_safetensors=False,
                 save_only_model=save_only_model)
         trainer_args._n_gpu = 1
         trainer = BertTrainer(model, trainer_args, data_collator, train_dataset, val_dataset, tokenizer)

@@ -1,4 +1,7 @@
 # VLLM Inference Acceleration and Deployment
+The models supported by vllm can be found in [Supported Models](../Instruction/Supported-models-datasets.md#Models).
+
+You can check the best practices for inference acceleration and deployment of Llama 3.1 405b [here](https://github.com/modelscope/ms-swift/issues/1484).
 
 ## Table of Contents
 - [Environment Preparation](#environment-preparation)
@@ -24,7 +27,6 @@ pip install -r requirements/llm.txt -U
 ```
 
 ## Inference Acceleration
-The models supported by vllm can be found in [Supported Models](Supported-models-datasets.md#Models).
 
 ### Using Python
 ```python
@@ -37,7 +39,8 @@ from swift.llm import (
 )
 
 model_type = ModelType.qwen_7b_chat
-llm_engine = get_vllm_engine(model_type)
+model_id_or_path = None
+llm_engine = get_vllm_engine(model_type, model_id_or_path=model_id_or_path)
 template_type = get_default_template_type(model_type)
 template = get_template(template_type, llm_engine.hf_tokenizer)
 # Similar to `transformers.GenerationConfig` interface
@@ -103,7 +106,7 @@ RAY_memory_monitor_refresh_ms=0 CUDA_VISIBLE_DEVICES=0,1 swift infer \
 
 **Single sample inference**:
 
-For models fine-tuned using LoRA, you need to first [merge-lora](LLM-fine-tuning.md#merge-lora) to generate a complete checkpoint directory.
+For models fine-tuned using LoRA, you need to first [merge-lora](../Instruction/LLM-fine-tuning.md#merge-lora) to generate a complete checkpoint directory.
 
 Models fine-tuned with full parameters can seamlessly use VLLM for inference acceleration.
 ```python
@@ -136,7 +139,6 @@ CUDA_VISIBLE_DEVICES=0 swift export \
     --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx' --merge_lora true
 
 # Evaluate using dataset
-# If you want to infer all dataset samples, please additionally specify `--show_dataset_sample -1`.
 CUDA_VISIBLE_DEVICES=0 swift infer \
     --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx-merged' \
     --infer_backend vllm \
@@ -168,9 +170,11 @@ CUDA_VISIBLE_DEVICES=0 swift app-ui --ckpt_dir 'xxx/vx-xxx/checkpoint-xxx-merged
 ## Deployment
 Swift uses VLLM as the inference backend and is compatible with the OpenAI API style.
 
-For server deployment command line arguments, refer to: [deploy command line arguments](Command-line-parameters.md#deploy-Parameters).
+For server deployment command line arguments, refer to: [deploy command line arguments](../Instruction/Command-line-parameters.md#deploy-Parameters).
 
 For OpenAI API arguments on the client side, refer to: https://platform.openai.com/docs/api-reference/introduction.
+
+Benchmark testing code: https://github.com/modelscope/ms-swift/blob/main/scripts/benchmark/deploy.py
 
 ### Original Models
 #### qwen-7b-chat
@@ -512,7 +516,7 @@ The example code for the client side is the same as the original models.
 The current model deployment method now supports multiple LoRA deployments with `peft>=0.10.0`. The specific steps are:
 
 - Ensure `merge_lora` is set to `False` during deployment.
-- Use the `--lora_modules` argument, which can be referenced in the [command line documentation](Command-line-parameters.md).
+- Use the `--lora_modules` argument, which can be referenced in the [command line documentation](../Instruction/Command-line-parameters.md).
 - Specify the name of the LoRA tuner in the model field during inference.
 
 Example:

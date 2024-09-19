@@ -6,7 +6,7 @@ import sys
 from typing import Dict, List, Optional
 
 ROUTE_MAPPING: Dict[str, str] = {
-    'pt': 'swift.cli.sft',
+    'pt': 'swift.cli.pt',
     'sft': 'swift.cli.sft',
     'infer': 'swift.cli.infer',
     'app-ui': 'swift.cli.app_ui',
@@ -53,19 +53,11 @@ def cli_main() -> None:
         argv = ['--rlhf_type', method_name] + argv
     file_path = importlib.util.find_spec(ROUTE_MAPPING[method_name]).origin
     torchrun_args = get_torchrun_args()
-    if torchrun_args is None or method_name not in ('sft', 'dpo', 'orpo', 'simpo', 'rlhf', 'pt'):
-        try:
-            python_cmd = 'python'
-            subprocess.run(
-                [python_cmd, '--version'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            python_cmd = 'python3'
+    python_cmd = sys.executable
+    if torchrun_args is None or method_name not in ('pt', 'sft', 'dpo', 'orpo', 'simpo', 'rlhf'):
         args = [python_cmd, file_path, *argv]
     else:
-        args = ['torchrun', *torchrun_args, file_path, *argv]
+        args = [python_cmd, '-m', 'torch.distributed.run', *torchrun_args, file_path, *argv]
     print(f"run sh: `{' '.join(args)}`", flush=True)
     result = subprocess.run(args)
     if result.returncode != 0:

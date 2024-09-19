@@ -2,12 +2,10 @@
 # 80GB GPU memory
 # Note: TorchAcc is currently only available internally.
 export USE_TORCHACC=1
-export XLA_IR_SHAPE_CACHE_SIZE=100000000
-export XLA_ALLOCATOR_FRACTION=0.95
 export XLA_EXPERIMENTAL=nonzero:masked_select
 
-export XLA_PERSISTENT_CACHE_PATH=./output/compiled_cache/Meta-Llama-3-8B-Instruct
-mkdir -p $XLA_PERSISTENT_CACHE_PATH
+export TORCHACC_CACHE_PATH=./output/compiled_cache/Meta-Llama-3-8B-Instruct
+mkdir -p $TORCHACC_CACHE_PATH
 
 NPROC_PER_NODE=2 \
 CUDA_VISIBLE_DEVICES=0,1 \
