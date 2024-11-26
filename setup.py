@@ -1,8 +1,8 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 # !/usr/bin/env python
 import os
-import shutil
 from setuptools import find_packages, setup
+from typing import List
 
 
 def readme():
@@ -150,10 +150,11 @@ if __name__ == '__main__':
             'License :: OSI Approved :: Apache Software License',
             'Operating System :: OS Independent',
             'Programming Language :: Python :: 3',
-            'Programming Language :: Python :: 3.7',
             'Programming Language :: Python :: 3.8',
             'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
+            'Programming Language :: Python :: 3.11',
+            'Programming Language :: Python :: 3.12',
         ],
         license='Apache License 2.0',
         tests_require=parse_requirements('requirements/tests.txt'),

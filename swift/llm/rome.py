@@ -3,7 +3,7 @@ from typing import Optional
 
 import json
 import torch
-from modelscope import GenerationConfig
+from transformers import GenerationConfig
 
 from swift.tuners import Swift
 from swift.tuners.rome import RomeConfig
@@ -68,8 +68,7 @@ def rome_infer(args: RomeArguments) -> None:
     # Inference
     template: Template = get_template(args.template_type, tokenizer, args.system, args.max_length,
                                       args.truncation_strategy)
-    args.system = template.default_system
-    logger.info(f'system: {args.system}')
+    logger.info(f'system: {template.default_system}')
 
     # Inference
     if args.eval_human:

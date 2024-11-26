@@ -27,14 +27,26 @@ def get_bucket_sizes(max_length: int) -> List[int]:
     the bucket sizes. If not set, we use a normal distribution bucketing with
     8 buckets.
     """
+    padding_p_base = 2
     if os.getenv('TORCHACC_DATA_BUCKETS') is not None:
         bucket_sizes = [int(x) for x in os.getenv('TORCHACC_DATA_BUCKETS').split(',')]
         bucket_sizes.append(max_length)
-    else:  # default normal distribution bucketing.
-        mean = max_length // 2
-        var = max_length // 8
-        bucket_sizes = [mean + i * var for i in range(-3, 4)]
+    else:
+        if os.getenv('TORCHACC_CACHE_PATH') is not None:  # padding strategy when persistent cache is enabled
+            padding_p_base = 1.4
+        padding_p_base = os.getenv('TORCHACC_PADDING_P_BASE', padding_p_base)
+        try:
+            padding_p_base = float(padding_p_base)
+        except ValueError as e:
+            logger.error(f'Expect TORCHACC_PADDINF_P_BASE to be a float number, but encountered {padding_p_base}')
+            raise e
+        bucket_sizes = [16, 32, 48, 64, 96, 128]
+        base_size = 256
+        while base_size < max_length:
+            bucket_sizes.append((int(base_size) + 127) // 128 * 128)
+            base_size *= padding_p_base
         bucket_sizes.append(max_length)
+
     return bucket_sizes
 
 
@@ -188,7 +200,7 @@ def save_ta_ddp_checkpoint(self_model, tokenizer, args, output_dir: Optional[str
 
     model = self_model
 
-    if xm.is_master_ordinal():
+    if xm.is_master_ordinal(local=False):
         os.makedirs(output_dir, exist_ok=True)
         torch.save(args, os.path.join(output_dir, 'training_args.bin'))
 
@@ -277,6 +289,8 @@ def save_ta_fsdp_checkpoint(self_model, tokenizer, args, output_dir):
                 torch.save(full_state_dict, os.path.join(output_dir, 'pytorch_model.bin'))
 
     xm.rendezvous('ckpt_consolidation')
+    # delete the sharded checkpoint.
+    os.remove(ckpt_path)
 
 
 def ta_trim_graph():
@@ -590,14 +604,20 @@ def patch_baichuan_model(model):
 
 def patch_qwen2_model(model):
 
+    def update_causal_mask(self, *args, **kwargs):
+        # attention_mask is not supported in TorchAcc.
+        return None
+
     def qwen2_attn_forward(
         self,
         hidden_states,
         attention_mask=None,
         position_ids=None,
         past_key_value=None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
 
@@ -623,9 +643,16 @@ def patch_qwen2_model(model):
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         # rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         rotary_seq_len = kv_seq_len + 1
-        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if version.parse(transformers.__version__) >= version.parse('4.45'):
+            if position_embeddings is None:
+                cos, sin = self.rotary_emb(value_states, position_ids)
+            else:
+                cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         dropout_rate = 0.0 if not self.training else self.attention_dropout
 
@@ -781,7 +808,10 @@ def patch_qwen2_model(model):
     for layer in model.model.layers:
         layer.self_attn.forward = types.MethodType(qwen2_attn_forward, layer.self_attn)
 
-    model.model.forward = types.MethodType(qwen2_forward, model.model)
+    if version.parse(transformers.__version__) >= version.parse('4.43'):
+        model.model._update_causal_mask = types.MethodType(update_causal_mask, model.model)
+    else:
+        model.model.forward = types.MethodType(qwen2_forward, model.model)
     return model
 
 

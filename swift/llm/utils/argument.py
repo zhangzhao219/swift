@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
+import accelerate
 import json
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ from .media import MediaTag
 from .model import (MODEL_MAPPING, dtype_mapping, get_additional_saved_files, get_default_lora_target_modules,
                     get_default_template_type)
 from .template import TEMPLATE_MAPPING
-from .utils import is_liger_available, is_lmdeploy_available, is_quant_model, is_vllm_available
+from .utils import get_mllm_arch, is_liger_available, is_lmdeploy_available, is_quant_model, is_vllm_available
 
 logger = get_logger()
 DATASET_TYPE = Union[HfDataset, HfIterableDataset]
@@ -139,7 +140,7 @@ class ArgumentsBase:
         if self.temperature == 0:
             self.do_sample = False
         if self.do_sample is False and (isinstance(self, InferArguments) and self.infer_backend == 'pt'
-                                        and isinstance(self, SftArguments)):
+                                        or isinstance(self, SftArguments)):
             # fix warning
             self.temperature = 1.
             self.top_p = 1.
@@ -780,6 +781,7 @@ class SftArguments(ArgumentsBase):
     use_liger: bool = False
 
     gradient_checkpointing: Optional[bool] = None
+    vit_use_gc: bool = True  # vit use gradient_checkpointing
     # e.g. 'default-zero3', 'default-zero2', 'ds_config/zero2.json', 'zero2-offload', 'zero3-offload'
     deepspeed: Optional[str] = None
     batch_size: int = 1
@@ -919,7 +921,7 @@ class SftArguments(ArgumentsBase):
             target_modules.append('DEFAULT')
         if 'DEFAULT' in target_modules:
             target_modules.remove('DEFAULT')
-            default_lora_tm = get_default_lora_target_modules(self.model_type)
+            default_lora_tm = get_default_lora_target_modules(self.model_type) or []
             if isinstance(default_lora_tm, str):
                 return default_lora_tm
             target_modules += default_lora_tm
@@ -1047,14 +1049,12 @@ class SftArguments(ArgumentsBase):
             if self.eval_steps is None:
                 self.eval_steps = 50
         elif self.sft_type == 'full':
-            if self.freeze_vit:
-                from swift.utils.module_mapping import MODEL_KEYS_MAPPING
-                lora_target_modules = model_info.get('lora_target_modules')
-                vision_tower = None
-                if isinstance(lora_target_modules, str):
-                    vision_tower = MODEL_KEYS_MAPPING[lora_target_modules].vision_tower
-                if vision_tower:
-                    self.freeze_parameters += vision_tower
+            mllm_arch = get_mllm_arch(self.model_type)
+            if mllm_arch:
+                if self.freeze_vit and mllm_arch.vision_tower:
+                    self.freeze_parameters += mllm_arch.vision_tower
+                if mllm_arch.generator:
+                    self.freeze_parameters += mllm_arch.generator
             assert 0 <= self.freeze_parameters_ratio <= 1
             assert self.quantization_bit == 0, 'Full parameter fine-tuning does not support quantization.'
             assert self.dtype != 'fp16', ("Fine-tuning with dtype=='fp16' can lead to NaN issues. "
@@ -1197,6 +1197,13 @@ class SftArguments(ArgumentsBase):
         if 'accelerator_config' in parameters:
             kwargs['accelerator_config'] = {'dispatch_batches': False}
 
+        metric_for_best_model = 'rouge-l' if self.predict_with_generate else 'loss'
+        if hasattr(self, 'rlhf_type') and self.rlhf_type == 'ppo':
+            metric_for_best_model = None
+
+        if version.parse('1.0') <= version.parse(accelerate.__version__) < version.parse('1.1'):
+            self.dataset_seed = None
+
         training_args = training_args_cls(
             output_dir=self.output_dir,
             logging_dir=self.logging_dir,
@@ -1221,7 +1228,7 @@ class SftArguments(ArgumentsBase):
             eval_steps=self.eval_steps,
             dataloader_num_workers=self.dataloader_num_workers,
             dataloader_pin_memory=self.dataloader_pin_memory,
-            metric_for_best_model='rouge-l' if self.predict_with_generate else 'loss',
+            metric_for_best_model=metric_for_best_model,
             greater_is_better=self.predict_with_generate,
             full_determinism=self.full_determinism,
             optim=self.optim,
@@ -1411,7 +1418,7 @@ class InferArguments(ArgumentsBase):
     max_model_len: Optional[int] = None
     disable_custom_all_reduce: bool = True  # Default values different from vllm
     enforce_eager: bool = False
-    limit_mm_per_prompt: Optional[str] = None
+    limit_mm_per_prompt: Optional[str] = None  # '{"image": 10, "video": 5}'
     vllm_enable_lora: bool = False
     vllm_max_lora_rank: int = 16
     lora_modules: List[str] = field(default_factory=list)
@@ -1547,7 +1554,7 @@ class InferArguments(ArgumentsBase):
             self.infer_media_type = 'interleave'
         self.media_type = template_info.get('media_type', 'image')
         self.media_key = MediaTag.media_keys.get(self.media_type, 'images')
-        if self.merge_device_map is None:
+        if self.merge_device_map is None and not isinstance(self, ExportArguments):
             self.merge_device_map = 'cpu'
 
     @staticmethod
@@ -1603,7 +1610,7 @@ class EvalArguments(InferArguments):
     eval_output_dir: str = 'eval_outputs'
     eval_backend: Literal['Native', 'OpenCompass'] = 'OpenCompass'
     eval_batch_size: int = 8
-    deploy_timeout: int = 60
+    deploy_timeout: int = 1800
 
     do_sample: bool = False  # Note: for evaluation default is False
     temperature: float = 0.
@@ -1662,7 +1669,7 @@ class ExportArguments(InferArguments):
     quant_method: Literal['awq', 'gptq', 'bnb'] = 'awq'
     quant_n_samples: int = 256
     quant_seqlen: int = 2048
-    quant_device_map: str = 'cpu'  # e.g. 'cpu', 'auto'
+    quant_device_map: Optional[str] = None  # e.g. 'cpu', 'auto'
     quant_output_dir: Optional[str] = None
     quant_batch_size: int = 1
 
@@ -1685,8 +1692,8 @@ class ExportArguments(InferArguments):
     # merge_lora, hub_token
 
     def __post_init__(self):
-        if self.merge_device_map is None:
-            self.merge_device_map = 'cpu' if self.quant_bits > 0 else 'auto'
+        if self.merge_device_map is None and self.quant_bits > 0:
+            self.merge_device_map = 'cpu'
         if self.quant_bits > 0 and self.dtype == 'AUTO':
             self.dtype = 'fp16'
             logger.info(f'Setting args.dtype: {self.dtype}')
@@ -1746,14 +1753,14 @@ class PtArguments(SftArguments):
 
 @dataclass
 class RLHFArguments(SftArguments):
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo'] = 'dpo'
     ref_model_type: Optional[str] = field(
         default=None, metadata={'help': f'model_type choices: {list(MODEL_MAPPING.keys())}'})
     ref_model_id_or_path: Optional[str] = None
     ref_model_revision: Optional[str] = None
 
     beta: Optional[float] = None
-    label_smoothing: float = 0
+    label_smoothing: float = 0.0
     # dpo: 'sigmoid', 'hinge', 'ipo', 'exo_pair', 'nca_pair', 'robust', 'bco_pair',
     #      'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down'
     # cpo: 'sigmoid', 'hinge', 'ipo', 'simpo'
@@ -1769,12 +1776,53 @@ class RLHFArguments(SftArguments):
     # KTO
     desirable_weight: float = 1.0
     undesirable_weight: float = 1.0
+    # PPO
+    reward_model_id_or_path: Optional[str] = None
+    reward_model_type: Optional[str] = field(
+        default=None, metadata={'help': f'model_type choices: {list(MODEL_MAPPING.keys())}'})
+    reward_model_revision: Optional[str] = None
+    local_rollout_forward_batch_size: int = 64
+    whiten_rewards: bool = False
+    kl_coef: float = 0.05
+    cliprange: float = 0.2
+    vf_coef: float = 0.1
+    cliprange_value: float = 0.2
+    gamma: float = 1.0
+    lam: float = 0.95
+    num_sample_generations: int = 10
 
     def __post_init__(self):
         self._check_simpo()
         self._set_default()
-        self.ref_model_free = self.rlhf_type in ['cpo', 'orpo']
-        super().__post_init__()
+        self.ref_model_free = self.rlhf_type in ['cpo', 'orpo', 'rm']
+        from contextlib import nullcontext, contextmanager
+
+        @contextmanager
+        def ppocontext():
+            from transformers.integrations.deepspeed import HfTrainerDeepSpeedConfig
+            from transformers.utils import is_sagemaker_mp_enabled
+            if is_sagemaker_mp_enabled():
+                import smdistributed.modelparallel.torch as smp
+                smp.init()
+            old_trainer_config_process = HfTrainerDeepSpeedConfig.trainer_config_process
+
+            def trainer_config_process(self, args, auto_find_batch_size=False):
+                if args.world_size is None:
+                    if args.distributed_state is not None:
+                        return args.distributed_state.num_processes
+                    elif is_sagemaker_mp_enabled():
+                        return smp.dp_size() if not smp.state.cfg.prescaled_batch else smp.rdp_size()
+                    return 1
+                return old_trainer_config_process(self, args, auto_find_batch_size)
+
+            HfTrainerDeepSpeedConfig.trainer_config_process = trainer_config_process
+            yield
+            HfTrainerDeepSpeedConfig.trainer_config_process = old_trainer_config_process
+
+        context = nullcontext if self.rlhf_type != 'ppo' else ppocontext
+        with context():
+            super().__post_init__()
+        self._check_ppo()
 
     def _check_simpo(self):
         if self.rlhf_type != 'simpo':
@@ -1792,6 +1840,23 @@ class RLHFArguments(SftArguments):
         if self.loss_type is None:
             if self.rlhf_type in ['dpo', 'cpo']:
                 self.loss_type = 'sigmoid'  # else None
+            elif self.rlhf_type in ['kto']:
+                self.loss_type = 'kto'
+        if self.rlhf_type == 'ppo':
+            self.response_length = self.max_new_tokens
+            logger.info(f'set max_new_tokens {self.max_new_tokens} in generation config during ppo,'
+                        'you can set by --max_new_tokens')
+            self.num_ppo_epochs = self.num_train_epochs
+            logger.info(
+                f'set num_ppo_epochs {self.num_train_epochs} in ppo training config, you can set by --num_train_epochs')
+
+    def _check_ppo(self):
+        if self.rlhf_type != 'ppo':
+            return
+        if self.streaming:
+            raise ValueError('Streaming is currently not supported by PPO')
+        if self.is_multimodal:
+            raise ValueError('MLLM is currently not supported by PPO')
 
 
 @dataclass

@@ -42,6 +42,11 @@ from .callback import DefaultFlowCallbackNew, PrinterCallbackNew, ProgressCallba
 from .optimizers.galore import create_optimizer_and_scheduler
 from .utils import can_return_loss, find_labels, get_function, is_instance_of_ms_model
 
+try:
+    from trl import AutoModelForCausalLMWithValueHead
+except (ImportError, RuntimeError):
+    AutoModelForCausalLMWithValueHead = None
+
 logger = get_logger()
 
 
@@ -98,7 +103,7 @@ class SwiftMixin:
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             **kwargs)
-        if not self.label_names:
+        if not hasattr(self, 'label_names') or not self.label_names:
             self.label_names = ['labels']
         if is_quantized and use_swift:
             model._hf_peft_config_loaded = _hf_peft_config_loaded
@@ -230,11 +235,49 @@ class SwiftMixin:
         if not use_torchacc():
             return super()._save_tpu(output_dir)
 
+        import torch_xla.core.xla_model as xm
+
+        # Compatible with swift and peft
         output_dir = output_dir if output_dir is not None else self.args.output_dir
+
+        if xm.is_master_ordinal(local=False):
+            os.makedirs(output_dir, exist_ok=True)
+            # configuration.json
+            model_dir = getattr(self.model, 'model_dir', None)
+            if model_dir is not None:
+                src_path = os.path.join(model_dir, 'configuration.json')
+                dst_path = os.path.join(output_dir, 'configuration.json')
+                if os.path.exists(src_path):
+                    shutil.copy(src_path, dst_path)
+            else:
+                self._create_configuration_file(self.model, output_dir)
+            self._add_adapter_cfg(output_dir)
+            self._save_sft_args(output_dir)
+            # generation_config
+            generation_config = getattr(self.args, 'generation_config', None)
+            if generation_config is not None:
+                generation_config.save_pretrained(output_dir)
+
+        # model
         if self.sft_args.fsdp_num > 1:
             save_ta_fsdp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
         else:
             save_ta_ddp_checkpoint(self.model, self.tokenizer, self.args, output_dir)
+        sft_args = getattr(self, 'sft_args', None)
+
+        # additional files
+        if xm.is_master_ordinal(local=False):
+            if sft_args is not None and sft_args.sft_type == 'full':
+                additional_files = getattr(self.args, 'additional_saved_files',
+                                           None) or [] + ['preprocessor_config.json']
+                if model_dir is not None:
+                    for file in additional_files:
+                        src_path = os.path.join(model_dir, file)
+                        dst_path = os.path.join(output_dir, file)
+                        if os.path.isfile(src_path):
+                            shutil.copy(src_path, dst_path)
+                        elif os.path.isdir(src_path):
+                            shutil.copytree(src_path, dst_path)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Compatible with swift and peft"""
@@ -257,7 +300,10 @@ class SwiftMixin:
         if generation_config is not None:
             generation_config.save_pretrained(output_dir)
         # model
+
         supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
+        if AutoModelForCausalLMWithValueHead is not None:
+            supported_classes = supported_classes + (AutoModelForCausalLMWithValueHead, )
         save_safetensors = self.args.save_safetensors
 
         if not isinstance(self.model, supported_classes):
@@ -276,6 +322,24 @@ class SwiftMixin:
         elif is_instance_of_ms_model(self.model):
             PreTrainedModel.save_pretrained(
                 self.model, output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
+        elif AutoModelForCausalLMWithValueHead is not None and isinstance(self.model,
+                                                                          AutoModelForCausalLMWithValueHead):
+            # save reward model
+            state_dict = self.model.state_dict()
+            decoder_state_dict, v_head_state_dict = {}, {}
+            for name, param in state_dict.items():
+                if name.startswith('v_head.'):
+                    v_head_state_dict[name] = param
+                else:
+                    decoder_state_dict[name.replace('pretrained_model.', '', 1)] = param
+            self.model.pretrained_model.save_pretrained(
+                output_dir, state_dict=decoder_state_dict or None, safe_serialization=save_safetensors)
+            if save_safetensors:
+                from safetensors.torch import save_file
+                save_file(
+                    v_head_state_dict, os.path.join(output_dir, 'value_head.safetensors'), metadata={'format': 'pt'})
+            else:
+                torch.save(v_head_state_dict, os.path.join(output_dir, 'value_head.bin'))
         else:
             self.model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=save_safetensors)
         sft_args = getattr(self, 'sft_args', None)
@@ -319,7 +383,12 @@ class SwiftMixin:
                 self.deepspeed._zero3_consolidated_16bit_state_dict = MethodType(_zero3_consolidated_16bit_state_dict,
                                                                                  self.deepspeed)
         if version.parse(transformers.__version__) >= version.parse('4.36') or not self.args.save_only_model:
-            result = super()._save_checkpoint(model, trial, metrics)
+            # fix transformers==4.47
+            kwargs = {}
+            parameters = inspect.signature(super()._save_checkpoint).parameters
+            if 'metrics' in parameters:
+                kwargs['metrics'] = metrics
+            result = super()._save_checkpoint(model, trial, **kwargs)
         else:
             result = self._save_only_model(model, trial, metrics)
         logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
@@ -637,15 +706,16 @@ class ModelWrapper(nn.Module):
     @contextmanager
     def _save_load_context(cls, trainer):
         # fix zero3 & save/load model
-        _model = trainer.deepspeed
-        _new_model = _model._model
-        _model.__dict__['module'] = _new_model
-        _model._modules['module'] = _new_model
+        deepspeed_model = trainer.deepspeed
+        _new_model = deepspeed_model._model
+        _old_model = deepspeed_model.__dict__['module']
+        deepspeed_model.__dict__['module'] = _new_model
+        deepspeed_model._modules['module'] = _new_model
         trainer.model = _new_model
         yield
-        _model.__dict__['module'] = _model
-        _model._modules['module'] = _model
-        trainer.model = _model
+        deepspeed_model.__dict__['module'] = _old_model
+        deepspeed_model._modules['module'] = _old_model
+        trainer.model = deepspeed_model
 
 
 class RLHFTrainerMixin:
@@ -671,8 +741,8 @@ class RLHFTrainerMixin:
         self.ref_model = ref_model
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         args = kwargs['args']
-        self.beta = args.beta
-        if args.disable_dropout:
+        self.beta = getattr(args, 'beta', 0.0)
+        if getattr(args, 'disable_dropout', False):
             disable_dropout_in_model(model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
@@ -680,7 +750,7 @@ class RLHFTrainerMixin:
         self.is_encoder_decoder = kwargs['is_encoder_decoder']
         self.aux_loss_enabled = getattr(model.config, 'output_router_logits', False)
         self._peft_has_been_casted_to_bf16 = False
-        self.generate_during_eval = args.generate_during_eval
+        self.generate_during_eval = getattr(args, 'generate_during_eval', False)
         self.is_multimodal = False
         if self.is_encoder_decoder:
             self.decoder_start_token_id = self.get_model_config_attr(model.config, 'decoder_start_token_id')
@@ -705,7 +775,6 @@ class RLHFTrainerMixin:
     def concatenated_forward(
         self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-
         model_kwargs = batch.copy()
         labels = model_kwargs.pop('labels', None)
         if self.is_encoder_decoder:
@@ -742,6 +811,15 @@ class RLHFTrainerMixin:
         if self.is_encoder_decoder:
             labels = labels.clone()  # fix trl bug
         return super().get_batch_logps(logits, labels, *args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=None, num_items_in_batch=None):
+        res = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        # compat transformers>=4.46.*
+        if num_items_in_batch is not None:
+            loss = res[0] if return_outputs else res
+            loss /= self.args.gradient_accumulation_steps
+            return (loss, res[1:]) if return_outputs else loss
+        return res
 
 
 # monkey patching

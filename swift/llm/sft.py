@@ -7,23 +7,22 @@ import json
 import torch
 import transformers
 from datasets import Dataset as HfDataset
-from modelscope import BitsAndBytesConfig, GenerationConfig
 from packaging import version
-from transformers import IntervalStrategy
+from transformers import BitsAndBytesConfig, GenerationConfig, IntervalStrategy
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.utils import is_torch_npu_available, strtobool
 
 from swift.torchacc_utils import patch_acc_model
 from swift.trainers import TrainerFactory
 from swift.trainers.utils import can_return_loss, find_labels
-from swift.utils import (append_to_jsonl, check_json_format, compute_acc_metrics, compute_nlg_metrics, get_logger,
-                         get_main, get_model_info, is_ddp_plus_mp, is_dist, is_master, plot_images,
+from swift.utils import (append_to_jsonl, check_json_format, compute_acc_metrics, compute_nlg_metrics, get_dist_setting,
+                         get_logger, get_main, get_model_info, is_ddp_plus_mp, is_dist, is_master, plot_images,
                          preprocess_logits_for_metrics, seed_everything, show_layers, use_torchacc)
 from .accelerator import ta_accelerate
 from .tuner import prepare_model
 from .utils import (TEMPLATE_MAPPING, LazyLLMDataset, PtArguments, RLHFArguments, SftArguments, Template, dataset_map,
-                    get_dataset, get_model_tokenizer, get_template, get_time_info, print_example, set_generation_config,
-                    sort_by_max_length, stat_dataset)
+                    deep_getattr, dynamic_vit_gradient_checkpointing, get_dataset, get_mllm_arch, get_model_tokenizer,
+                    get_template, get_time_info, print_example, set_generation_config, sort_by_max_length, stat_dataset)
 
 logger = get_logger()
 
@@ -54,6 +53,13 @@ def _get_train_val_dataset(args: SftArguments) -> Tuple[HfDataset, Optional[HfDa
             streaming_buffer_size=args.streaming_buffer_size)
 
     train_dataset, val_dataset = args._handle_dataset_compat(train_dataset, val_dataset)
+    if args.train_type == 'ppo':  # Remove response columns from dataset
+        existing_columns = list(next(iter(train_dataset)).keys())
+        columns_to_remove = [col for col in ['response', 'rejected_response'] if col in existing_columns]
+        train_dataset = train_dataset.map(remove_columns=columns_to_remove)
+        logger.info(f'remove columns: {columns_to_remove} in PPO')
+        if val_dataset is not None:
+            val_dataset = val_dataset.map(remove_columns=columns_to_remove)
     # The random shuffling of the training set occurs in the dataloader of the trainer.
     logger.info(f'train_dataset: {train_dataset}')
     logger.info(f'val_dataset: {val_dataset}')
@@ -115,7 +121,26 @@ def llm_sft_megatron(args: SftArguments) -> Dict[str, Any]:
     return {}
 
 
-def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
+def get_default_device_map():
+    if is_deepspeed_zero3_enabled() or os.environ.get('ACCELERATE_USE_FSDP', 'False') == 'true':
+        return None
+    local_rank = get_dist_setting()[1]
+    if is_torch_npu_available():
+        if local_rank >= 0:
+            return f'npu:{local_rank}'
+        else:
+            return 'npu:0'
+    if torch.cuda.device_count() == 0:
+        return 'cpu'
+    elif torch.cuda.device_count() == 1:
+        return 'cuda:0'
+    elif is_dist() and not is_ddp_plus_mp():
+        return f'cuda:{local_rank}'
+    else:
+        return 'auto'
+
+
+def prepare_model_template_train(args, msg: Optional[Dict[str, Any]] = None):
 
     if args.gpu_memory_fraction is not None:
         for device_id in range(torch.cuda.device_count()):
@@ -129,21 +154,15 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
           f'world_size: {args.world_size}, local_world_size: {args.local_world_size}')
 
     # Loading Model and Tokenizer
-    if is_deepspeed_zero3_enabled() or os.environ.get('ACCELERATE_USE_FSDP', 'False') == 'true':
-        model_kwargs = {'device_map': None}
-    elif is_torch_npu_available():
-        model_kwargs = {'device_map': args.local_rank if args.local_rank >= 0 else 0}
-    elif args.device_map_config is not None:
-        model_kwargs = {'device_map': args.device_map_config}
-    else:
-        model_kwargs = {'low_cpu_mem_usage': True}
-        if is_dist() and not is_ddp_plus_mp():
-            model_kwargs['device_map'] = {'': args.local_rank}
-        elif torch.cuda.device_count() == 1:
-            model_kwargs['device_map'] = 'cuda:0'
-        elif not use_torchacc():
-            model_kwargs['device_map'] = 'auto'
-
+    model_kwargs = {}
+    if not use_torchacc():
+        if args.device_map_config is not None:
+            device_map = args.device_map_config
+        else:
+            device_map = get_default_device_map()
+        model_kwargs['device_map'] = device_map
+        if device_map == 'auto':
+            model_kwargs['low_cpu_mem_usage'] = True
     if args.device_max_memory:
         n_gpu = torch.cuda.device_count()
         assert len(args.device_max_memory) == n_gpu // args.local_world_size
@@ -236,8 +255,23 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
         label_names = find_labels(model)
         return_loss = can_return_loss(model)
         model = patch_acc_model(model, args)
-        model.label_names = label_names
-        model.return_loss = return_loss
+
+    if args.is_multimodal and args.gradient_checkpointing and args.vit_use_gc:
+        dynamic_vit_gradient_checkpointing(model, args.model_type)
+
+    if args.gradient_checkpointing:
+        model.config.use_cache = False  # fix transformers==4.36
+        logger.info('Setting model.config.use_cache: False')
+        model.enable_input_require_grads()
+        mllm_arch = get_mllm_arch(args.model_type)
+        if mllm_arch is not None:
+            for vision_tower_name in mllm_arch.vision_tower:
+                vision_tower = deep_getattr(model, vision_tower_name)
+                if hasattr(vision_tower, 'enable_input_require_grads'):
+                    try:
+                        vision_tower.enable_input_require_grads()
+                    except NotImplementedError:
+                        pass
 
     # Preparing LoRA
     model, callbacks = prepare_model(model, args)
@@ -248,11 +282,6 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
     logger.info(model_info)
     if isinstance(msg, dict):
         msg['model_info'] = model_info
-
-    if args.gradient_checkpointing:
-        model.config.use_cache = False  # fix transformers==4.36
-        logger.info('Setting model.config.use_cache: False')
-        model.enable_input_require_grads()
 
     if use_torchacc():
         model.config.use_cache = False
@@ -265,6 +294,8 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
             args.fp16,
             gradient_checkpointing=True,
             fsdp_flatten_parameters=(args.sft_type == 'full'))
+        model.label_names = label_names
+        model.return_loss = return_loss
 
     template_kwargs = {}
     template_kwargs['use_loss_scale'] = args.use_loss_scale
@@ -289,8 +320,7 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
     template._is_training = True
     if args.streaming:
         template.encode = partial(template.encode, streaming=args.streaming)
-    args.system = template.default_system
-    logger.info(f'system: {args.system}')
+    logger.info(f'system: {template.default_system}')
     logger.info(f'args.lazy_tokenize: {args.lazy_tokenize}')
 
     if not isinstance(args, RLHFArguments):
@@ -298,7 +328,7 @@ def prepare_train_model_template(args, msg: Optional[Dict[str, Any]] = None):
 
     # ref_model
     ref_model = None
-    if not args.ref_model_free and (args.ref_model_type or args.sft_type == 'full'):
+    if not args.ref_model_free and (args.ref_model_type or args.sft_type == 'full' or args.rlhf_type == 'ppo'):
         if args.ref_model_type:
             kwargs['model_id_or_path'] = args.ref_model_id_or_path
             kwargs['revision'] = args.ref_model_revision
@@ -325,11 +355,6 @@ def prepare_dataset(args, template: Template, msg: Optional[Dict[str, Any]] = No
     if use_torchacc():
         training_args.train_dataset_sample = train_dataset.shape[0] if train_dataset is not None else 0
 
-    if val_dataset is None:
-        training_args.evaluation_strategy = IntervalStrategy.NO
-        training_args.eval_strategy = IntervalStrategy.NO
-        training_args.do_eval = False
-
     tokenizer = template.tokenizer
     dataset_info = {}
     if args.packing:
@@ -355,12 +380,15 @@ def prepare_dataset(args, template: Template, msg: Optional[Dict[str, Any]] = No
                                    f'Setting args.preprocess_num_proc to: {args.preprocess_num_proc}')
                 else:
                     template.model = None
-            logger.info(f'Using num_proc: {args.preprocess_num_proc}')
-        td0, tkwargs0 = template.encode(train_dataset[0])
+        if args.streaming:
+            td0 = template.encode(next(iter(train_dataset)))
+            tkwargs0 = {}
+        else:
+            td0, tkwargs0 = template.encode(train_dataset[0])
         print_example(td0, tokenizer, tkwargs0)
-        train_dataset = dataset_map(train_dataset, template.encode, args.preprocess_num_proc, streaming=args.streaming)
+        train_dataset = dataset_map(train_dataset, template.encode, args.preprocess_num_proc)
         if val_dataset is not None:
-            val_dataset = dataset_map(val_dataset, template.encode, args.preprocess_num_proc, streaming=args.streaming)
+            val_dataset = dataset_map(val_dataset, template.encode, args.preprocess_num_proc)
         template.model = model  # recover
         if args.test_oom_error:
             train_dataset = sort_by_max_length(train_dataset, 20000)
@@ -382,19 +410,28 @@ def prepare_dataset(args, template: Template, msg: Optional[Dict[str, Any]] = No
         train_dataset = LazyLLMDataset(train_dataset, template.encode)
         if val_dataset is not None:
             val_dataset = LazyLLMDataset(val_dataset, template.encode)
+
+    if val_dataset is None:
+        training_args.evaluation_strategy = IntervalStrategy.NO
+        training_args.eval_strategy = IntervalStrategy.NO
+        training_args.do_eval = False
     if isinstance(msg, dict):
         msg['dataset_info'] = dataset_info
     return train_dataset, val_dataset
 
 
-def trainer_train(args,
-                  model,
-                  template,
-                  train_dataset,
-                  val_dataset,
-                  callbacks=None,
-                  msg=None,
-                  ref_model=None) -> Dict[str, Any]:
+def trainer_train(
+    args,
+    model,
+    template,
+    train_dataset,
+    val_dataset,
+    callbacks=None,
+    msg=None,
+    ref_model=None,
+    reward_model=None,
+    value_model=None,
+) -> Dict[str, Any]:
     if msg is None:
         msg = {}
     training_args = args.training_args
@@ -429,7 +466,9 @@ def trainer_train(args,
             compute_acc_metrics, acc_strategy=args.acc_strategy, is_encoder_decoder=is_encoder_decoder)
         trainer_kwargs['compute_metrics'] = compute_metrics
         trainer_kwargs['preprocess_logits_for_metrics'] = preprocess_logits_for_metrics
-
+    if args.train_type == 'ppo':
+        trainer_kwargs['reward_model'] = reward_model
+        trainer_kwargs['value_model'] = value_model
     trainer = trainer_cls(
         model=model,
         args=training_args,
@@ -452,6 +491,7 @@ def trainer_train(args,
                 json.dump(check_json_format(args_obj.__dict__), f, ensure_ascii=False, indent=2)
     logging_path = os.path.join(args.output_dir, 'logging.jsonl')
     logger.info(f'The logging file will be saved in: {logging_path}')
+    trainer.model_accepts_loss_kwargs = True  # fix transformers>=4.46.2
     with template.training_context():
         trainer.train(training_args.resume_from_checkpoint)
     last_model_checkpoint = getattr(trainer.state, 'last_model_checkpoint', None)
@@ -501,7 +541,7 @@ def llm_sft(args: SftArguments) -> Dict[str, Any]:
     if args.train_backend == 'megatron':
         return llm_sft_megatron(args)
     msg = {}
-    model, template, callbacks = prepare_train_model_template(args, msg)
+    model, template, callbacks = prepare_model_template_train(args, msg)
     train_dataset, val_dataset = prepare_dataset(args, template, msg)
     return trainer_train(args, model, template, train_dataset, val_dataset, callbacks=callbacks, msg=msg)
 

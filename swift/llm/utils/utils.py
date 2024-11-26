@@ -10,6 +10,7 @@ from functools import partial, wraps
 from queue import Empty, Queue
 from tempfile import TemporaryDirectory
 from threading import Thread
+from types import MethodType
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import accelerate
@@ -18,6 +19,8 @@ import numpy as np
 import requests
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import torch.utils.checkpoint
 import transformers
 from datasets import Dataset as HfDataset
 from datasets import IterableDataset as HfIterableDataset
@@ -33,7 +36,7 @@ from transformers.utils import is_torch_npu_available
 
 from swift.hub import ModelScopeConfig
 from swift.utils import get_dist_setting, get_logger, is_ddp_plus_mp, stat_array, upper_bound, use_torchacc
-from swift.utils.module_mapping import MODEL_KEYS_MAPPING
+from swift.utils.module_mapping import MODEL_KEYS_MAPPING, MultiModelKeys
 from .template import History, StopWords, StopWordsCriteria, Template
 
 DATASET_TYPE = Union[HfDataset, HfIterableDataset]
@@ -264,6 +267,44 @@ class LazyLLMDataset(Dataset):
         return len(self.dataset)
 
 
+class LLMIterableDataset(HfIterableDataset):
+
+    def __init__(self, dataset: HfIterableDataset, max_retries=10):
+        super().__init__(
+            dataset._ex_iterable,
+            dataset._info,
+            dataset._split,
+            dataset._formatting,
+            dataset._shuffling,
+            dataset._distributed,
+            dataset._token_per_repo_id,
+        )
+        self.dataset = dataset
+        self.max_retries = max_retries
+        from .dataset import standard_keys
+        dataset._ex_iterable.remove_columns = standard_keys & next(iter(dataset)).keys()
+
+    def __iter__(self):
+        iterator = iter(self.dataset)
+        while True:
+            retries = 0
+            while retries < self.max_retries:
+                try:
+                    value = next(iterator)
+                    if value:
+                        yield value
+                        break
+                    else:
+                        raise ValueError
+                except StopIteration:
+                    iterator = iter(self.dataset)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries >= self.max_retries:
+                        raise e
+
+
 MapFunc = Callable[[Dict[str, Any]], Tuple[Dict[str, Any], Dict[str, Any]]]
 
 
@@ -274,19 +315,30 @@ def _single_map(d: Dict[str, Any], map_func: MapFunc) -> Optional[Dict[str, Any]
     return d
 
 
-def _map_mp_single(subset: HfDataset, map_func: MapFunc, queue: Queue, start_idx: int):
-    for i, d in enumerate(subset, start=start_idx):
-        queue.put((i, map_func(d)))  # idx, result
+def _map_mp_single(shard: HfDataset, map_func: MapFunc, queue: Queue, rank: int):
+    batch_size = 64
+    pre_i = -1
+    result = []
+    for i, d in enumerate(shard):
+        output = map_func(d)
+        if output is not None:
+            result.append(output)
+        if i == len(shard) - 1 or (i + 1) % batch_size == 0:
+            queue.put((rank, result, i - pre_i))
+            pre_i = i
+            result = []
 
 
 def _map_mp_i(dataset: HfDataset, map_func: MapFunc, num_proc: int) -> Iterator[Tuple[int, Dict[str, Any]]]:
+    pre_environ = deepcopy(os.environ)
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     with multiprocess.Pool(num_proc) as pool, multiprocess.Manager() as manager:
+        os.environ = pre_environ
         queue = manager.Queue()
         async_results = []
-        split_idx = np.linspace(0, len(dataset), num_proc + 1, dtype=np.int32)
+        shard_list = [dataset.shard(num_proc, i, contiguous=True) for i in range(num_proc)]
         for i in range(num_proc):
-            subset = dataset.select(range(split_idx[i], split_idx[i + 1]))
-            async_results.append(pool.apply_async(_map_mp_single, args=(subset, map_func, queue, split_idx[i])))
+            async_results.append(pool.apply_async(_map_mp_single, args=(shard_list[i], map_func, queue, i)))
         while True:
             try:
                 yield queue.get(timeout=0.05)
@@ -297,30 +349,34 @@ def _map_mp_i(dataset: HfDataset, map_func: MapFunc, num_proc: int) -> Iterator[
 
 def _map_mp(dataset: HfDataset, map_func: MapFunc, num_proc: int) -> List[Dict[str, Any]]:
     # Solving the unordered problem
-    data = [None] * len(dataset)
     num_proc = min(num_proc, len(dataset))
-    for d in tqdm(_map_mp_i(dataset, map_func, num_proc), total=len(dataset)):
-        data[d[0]] = d[1]
-    return data
+    data_list = [[] for _ in range(num_proc)]
+    prog_bar = tqdm(total=len(dataset), desc=f'Map (num_proc={num_proc})', dynamic_ncols=True)
+    for d in _map_mp_i(dataset, map_func, num_proc):
+        data_list[d[0]] += d[1]
+        prog_bar.update(d[2])
+    prog_bar.close()
+    res = []
+    for data in data_list:
+        res += data
+    return res
 
 
-def dataset_map(dataset: DATASET_TYPE,
-                map_func: MapFunc,
-                num_proc: int = 1,
-                streaming: bool = False) -> Optional[Union[LLMDataset, DATASET_TYPE]]:
-    if streaming:
+def dataset_map(dataset: DATASET_TYPE, map_func: MapFunc, num_proc: int = 1) -> Union[LLMDataset, LLMIterableDataset]:
+    """This solution will be deprecated in ms-swift3.0."""
+    if isinstance(dataset, HfIterableDataset):
         return LLMIterableDataset(dataset.map(map_func))  # num_proc is not supported for IterableDataset
 
     single_map = partial(_single_map, map_func=map_func)
     if num_proc == 1:
         data = []
-        for d in tqdm(dataset):
+        for d in tqdm(dataset, desc='Map'):
             d = single_map(d)
-            data.append(d)
+            if d is not None:
+                data.append(d)
     else:
         assert num_proc > 1
         data = _map_mp(dataset, single_map, num_proc)
-    data = [d for d in data if d is not None]
     if len(data) == 0:
         logger.warning('len(dataset): 0')
         return None
@@ -419,6 +475,62 @@ def find_ln(model: Module) -> List[str]:
             module_name = '.'.join(name.split('.')[-1:])
             module_names.add(module_name)
     return list(module_names)
+
+
+def _find_module_list(vision_tower) -> Optional[nn.ModuleList]:
+    module_lists = []
+    for m in vision_tower.modules():
+        if hasattr(m, 'gradient_checkpointing'):
+            return
+        if isinstance(m, nn.ModuleList) and len(m) >= 10:
+            module_lists.append(m)
+    if module_lists:
+        return max(module_lists, key=lambda x: len(x))
+
+
+def _add_gradient_checkpointing(module_list):
+
+    def _new_forward(self, *args, **kwargs):
+        layer_ret = torch.utils.checkpoint.checkpoint(self.__old_forward, *args, **kwargs)
+        return layer_ret
+
+    for module in module_list:
+        if hasattr(module, '_old_forward'):  # device_map
+            __old_forward = module._old_forward
+            module._old_forward = MethodType(_new_forward, module)
+        else:
+            __old_forward = module.forward
+            module.forward = MethodType(_new_forward, module)
+        module.__old_forward = __old_forward
+
+
+def deep_getattr(model, attr: str):
+    attrs = attr.split('.')
+    for a in attrs:
+        model = getattr(model, a)
+    return model
+
+
+def get_mllm_arch(model_type: str) -> MultiModelKeys:
+    from .model import MODEL_MAPPING
+    model_info = MODEL_MAPPING[model_type]
+    lora_target_modules = model_info.get('lora_target_modules')  # model_group
+    if not isinstance(lora_target_modules, str):
+        return None
+    return MODEL_KEYS_MAPPING[lora_target_modules]
+
+
+def dynamic_vit_gradient_checkpointing(model, model_type: str) -> None:
+    mllm_arch = get_mllm_arch(model_type)
+    if mllm_arch is None:
+        return
+    for vision_tower_name in mllm_arch.vision_tower:
+        vision_tower = deep_getattr(model, vision_tower_name)
+        module_list = _find_module_list(vision_tower)
+        if module_list is None:
+            continue
+        _add_gradient_checkpointing(module_list)
+        logger.info(f'Automatically add gradient_checkpointing to {vision_tower.__class__}.')
 
 
 def find_embedding(model: Module) -> List[str]:
@@ -589,8 +701,8 @@ def _prepare_inputs(model: PreTrainedModel,
         inputs_embeds = inputs['inputs_embeds'][None]
         inputs['inputs_embeds'] = inputs_embeds
         token_len = inputs_embeds.shape[1]
-
-    inputs['attention_mask'] = torch.ones(token_len, dtype=torch.int64)[None]
+    if 'attention_mask' not in inputs:
+        inputs['attention_mask'] = torch.ones(token_len, dtype=torch.int64)[None]
     if 'token_type_ids' in inputs:
         inputs['token_type_ids'] = torch.tensor(inputs['token_type_ids'])[None]
     model.eval()
@@ -988,44 +1100,6 @@ def get_time_info(log_history: List[Dict[str, Any]], n_train_samples: Optional[i
     except Exception:
         pass
     return time_info
-
-
-class LLMIterableDataset(HfIterableDataset):
-
-    def __init__(self, dataset: HfIterableDataset, max_retries=10):
-        super().__init__(
-            dataset._ex_iterable,
-            dataset._info,
-            dataset._split,
-            dataset._formatting,
-            dataset._shuffling,
-            dataset._distributed,
-            dataset._token_per_repo_id,
-        )
-        self.dataset = dataset
-        self.max_retries = max_retries
-        from .dataset import standard_keys
-        dataset._ex_iterable.remove_columns = standard_keys & next(iter(dataset)).keys()
-
-    def __iter__(self):
-        iterator = iter(self.dataset)
-        while True:
-            retries = 0
-            while retries < self.max_retries:
-                try:
-                    value = next(iterator)
-                    if value:
-                        yield value
-                        break
-                    else:
-                        raise ValueError
-                except StopIteration:
-                    iterator = iter(self.dataset)
-                    break
-                except Exception as e:
-                    retries += 1
-                    if retries >= self.max_retries:
-                        raise e
 
 
 def get_max_model_len(config: PretrainedConfig, ignore_rope_scaling=False) -> Optional[int]:

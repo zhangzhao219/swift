@@ -90,7 +90,7 @@ def rescale_image(img: 'PIL.Image.Image', rescale_image: int = -1) -> 'PIL.Image
     ratio = width / height
     height_scaled = math.pow(rescale_image / ratio, 0.5)
     width_scaled = height_scaled * ratio
-    return T.Resize((int(width_scaled), int(height_scaled)))(img)
+    return T.Resize((int(height_scaled), int(width_scaled)))(img)
 
 
 _T = TypeVar('_T')
@@ -206,10 +206,11 @@ def draw_plot(img_dir: str, bbox: List[int], bbox_type: str, output_file: str):
 @load_file_decorator
 def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
     from decord import cpu, VideoReader, bridge
+    from .template import get_env_args
     bridge.set_bridge('torch')
     clip_end_sec = 60
     clip_start_sec = 0
-    num_frames = 24
+    num_frames = get_env_args('num_frames', int, 24)
     decord_vr = VideoReader(video_io, ctx=cpu(0))
     duration = len(decord_vr)  # duration in terms of frames
     start_frame = int(clip_start_sec * decord_vr.get_avg_fps())
@@ -224,9 +225,11 @@ def load_video_cogvlm2(video_io: BytesIO) -> np.ndarray:
 @load_file_decorator
 def load_video_llava(video_io: BytesIO) -> np.ndarray:
     import av
+    from .template import get_env_args
     container = av.open(video_io)
     total_frames = container.streams.video[0].frames
-    indices = np.arange(0, total_frames, total_frames / 8).astype(int)
+    num_frames = get_env_args('num_frames', int, 16)
+    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
     frames = []
     container.seek(0)
     start_index = indices[0]
@@ -284,16 +287,17 @@ def load_video_qwen2(video_path: str):
     )
     nframes = get_env_args('nframes', int, None)
     fps = get_env_args('fps', int, None)
-    size_factor = get_env_args('size_factor', int, FRAME_FACTOR)
+    size_factor = get_env_args('frame_factor', int, FRAME_FACTOR, ['size_factor'])
     assert not (fps and nframes), 'Only accept either `fps` or `nframes`'
     if nframes is not None:
         nframes = round_by_factor(nframes, size_factor)
     else:
-        fps = FPS
+        if fps is None:
+            fps = FPS
         nframes = video.size(0) / info['video_fps'] * fps
         nframes = round_by_factor(nframes, size_factor)
-        min_frames = get_env_args('min_frames', int, FPS_MIN_FRAMES)
-        max_frames = get_env_args('max_frames', int, FPS_MAX_FRAMES)
+        min_frames = get_env_args('fps_min_frames', int, FPS_MIN_FRAMES, ['min_frames'])
+        max_frames = get_env_args('fps_max_frames', int, FPS_MAX_FRAMES, ['max_frames'])
         if nframes < min_frames:
             nframes = ceil_by_factor(min_frames, size_factor)
         if nframes > max_frames:
@@ -306,9 +310,9 @@ def load_video_qwen2(video_path: str):
     height, width = video.shape[2:]
     video = video[idx]
 
-    min_pixels = get_env_args('min_pixels', int, VIDEO_MIN_PIXELS)
-    total_pixels = get_env_args('total_pixels', int, VIDEO_TOTAL_PIXELS)
-    max_pixels = get_env_args('max_pixels', int, None)
+    min_pixels = get_env_args('video_min_pixels', int, VIDEO_MIN_PIXELS, ['min_pixels'])
+    total_pixels = get_env_args('video_total_pixels', int, VIDEO_TOTAL_PIXELS, ['total_pixels'])
+    max_pixels = get_env_args('video_max_pixels', int, None, ['max_pixels'])
     if max_pixels is None:
         max_pixels = VIDEO_MAX_PIXELS
         max_pixels = max(min(max_pixels, total_pixels / nframes * size_factor), min_pixels * 1.05)

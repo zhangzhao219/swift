@@ -1,5 +1,6 @@
 
 # Qwen2-VL Best Practice
+The best practices for qwen2-vl-72b-instruct can be found [here](https://github.com/modelscope/ms-swift/issues/2064).
 
 ## Table of Contents
 - [Environment Setup](#environment-setup)
@@ -13,7 +14,6 @@ git clone https://github.com/modelscope/swift.git
 cd swift
 pip install -e .[llm]
 
-pip install git+https://github.com/huggingface/transformers.git
 pip install pyav qwen_vl_utils
 ```
 

@@ -10,9 +10,12 @@ from trl import KTOTrainer as HFKTOTrainer
 
 from swift.llm import LLMDataset
 from swift.trainers import PushToMsHubMixin, RLHFTrainerMixin, SwiftMixin
-from swift.utils import get_dist_setting
+from swift.utils import get_dist_setting, get_logger
+
+logger = get_logger()
 
 del HFKTOTrainer.__init__
+del HFKTOTrainer.get_batch_samples
 
 
 def _add_kl_dataset(dataset: LLMDataset, total_batch_size: int, seed: Optional[int] = None) -> None:
@@ -20,6 +23,7 @@ def _add_kl_dataset(dataset: LLMDataset, total_batch_size: int, seed: Optional[i
     raw_dataset: List[Dict[str, Any]] = dataset.data
     random_state = np.random.RandomState(seed)
     random_state.shuffle(raw_dataset)
+
     i = 0
     while i < len(raw_dataset):
         new_dataset_group = []
@@ -33,7 +37,7 @@ def _add_kl_dataset(dataset: LLMDataset, total_batch_size: int, seed: Optional[i
                 'labels': data['labels'],
                 'KL_input_ids': kl_input_ids,
                 'KL_labels': kl_labels,
-                'label': kl_data['label']
+                'label': data['label']
             })
         raw_dataset[i:i + total_batch_size] = new_dataset_group
         i += total_batch_size
@@ -52,17 +56,26 @@ class KTOTrainer(RLHFTrainerMixin, PushToMsHubMixin, SwiftMixin, HFKTOTrainer):
         self.undesirable_weight = args.undesirable_weight
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
         self.is_peft_model = isinstance(model, PeftModel)
+        if hasattr(args, 'loss_type'):
+            self.loss_type = args.loss_type
+        else:
+            self.loss_type = 'kto'
 
         self.ref_adapter_name = None
-        # Get KL datasets
-        world_size = get_dist_setting()[2]
-        total_batch_size = (world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps)
-        if total_batch_size <= 1:
-            raise ValueError('Batch size is 1 (too small). KTO will not work properly because the KL term '
-                             'will be equivalent to the implied reward.')
+        # Not all losses require a KL calculation
+        self.calculate_KL = True
+        if self.loss_type in ['apo_zero_unpaired']:
+            self.calculate_KL = False
         train_dataset, eval_dataset = kwargs['train_dataset'], kwargs['eval_dataset']
-        _add_kl_dataset(train_dataset, total_batch_size, args.data_seed)
-        _add_kl_dataset(eval_dataset, total_batch_size, args.data_seed)
+        # Get KL datasets
+        if self.calculate_KL:
+            world_size = get_dist_setting()[2]
+            total_batch_size = (world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps)
+            if total_batch_size <= 1:
+                raise ValueError('Batch size is 1 (too small). KTO will not work properly because the KL term '
+                                 'will be equivalent to the implied reward.')
+            _add_kl_dataset(train_dataset, total_batch_size, args.data_seed)
+            _add_kl_dataset(eval_dataset, total_batch_size, args.data_seed)
         label = train_dataset['label']
         num_desirable = max(sum(label), 1)
         num_undesirable = max(len(label) - num_desirable, 1)  # "label" is binary
@@ -78,6 +91,7 @@ class KTOTrainer(RLHFTrainerMixin, PushToMsHubMixin, SwiftMixin, HFKTOTrainer):
             und_weight_in_range = und_weight_lower_bound <= self.undesirable_weight <= und_weight_upper_bound
 
             if not (des_weight_in_range or und_weight_in_range):
+                logger.info(f'desirable_weight: {self.desirable_weight}, undesirable_weight: {self.undesirable_weight}')
                 warnings.warn(
                     f"""
             You have different amounts of desirable/positive and undesirable/negative examples but the
