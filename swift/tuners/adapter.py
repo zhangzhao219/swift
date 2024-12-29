@@ -9,8 +9,7 @@ import torch
 from torch import nn
 from transformers.activations import ACT2CLS
 
-from swift import get_logger
-from swift.utils.torch_utils import find_sub_module
+from swift.utils.torch_utils import find_sub_module, get_logger
 from .utils import ActivationMixin, SwiftAdapter, SwiftConfig, SwiftOutput
 
 logger = get_logger()
@@ -137,7 +136,7 @@ class AdapterModule(nn.Module, ActivationMixin):
     'Parameter-Efficient Transfer Learning for NLP' by Houlsby et al.(2019)
     See http://arxiv.org/abs/1902.00751
 
-    Attributes:
+    Args:
         dim: An integer indicating the embedding dimension.
         adapter_length: An integer indicating the length of adapter tuning.
     """

@@ -12,12 +12,13 @@ import torch
 import torch.nn
 import transformers
 from modelscope import snapshot_download
-from peft import (AdaLoraConfig, BOFTConfig, BOFTModel, IA3Config, IA3Model, LoftQConfig, LoHaConfig, LoKrConfig,
-                  LoraModel, OFTConfig, PeftConfig, PeftModel, PeftModelForCausalLM, PeftModelForSeq2SeqLM,
+from peft import (AdaLoraConfig, BOFTConfig, BOFTModel, LoftQConfig, LoHaConfig, LoKrConfig, LoraModel, OFTConfig,
+                  PeftConfig, PeftModel, PeftModelForCausalLM, PeftModelForSeq2SeqLM,
                   PeftModelForSequenceClassification, PeftModelForTokenClassification, PrefixTuningConfig,
                   PromptEncoderConfig, PromptLearningConfig, PromptTuningConfig, VeraConfig, VeraModel, get_peft_config,
                   get_peft_model, get_peft_model_state_dict)
 from peft.config import PeftConfigMixin
+from peft.tuners import lora
 from peft.tuners.lora import Embedding
 from transformers import Trainer
 
@@ -28,6 +29,11 @@ try:
 except ImportError:
     FourierFTModel = None
 
+try:
+    from peft import BoneModel
+except ImportError:
+    BoneModel = None
+
 logger = get_logger()
 dispatchers = []
 
@@ -37,7 +43,7 @@ class LoraConfig(peft.LoraConfig):
     lora_dtype: Optional[str] = field(
         default=None, metadata={'help': 'The lora dtype, default None means following the original layer\'s dtype'})
 
-    lorap_lr_ratio: float = field(default=2.0**4, metadata={'help': 'The lr ratio of lora_B in lora+'})
+    lorap_lr_ratio: Optional[float] = field(default=None, metadata={'help': 'The lr ratio of lora_B in lora+'})
 
     lorap_emb_lr: float = field(default=1e-6, metadata={'help': 'The lr for embedding in lora+'})
 
@@ -55,7 +61,7 @@ class LoraConfig(peft.LoraConfig):
             'lorap_lr_ratio': self.lorap_lr_ratio,
             'lorap_emb_lr': self.lorap_emb_lr,
         }
-        with open(os.path.join(save_directory, 'additional_config.json'), 'w') as f:
+        with open(os.path.join(save_directory, 'additional_config.json'), 'w', encoding='utf-8') as f:
             json.dump(additional_args, f)
 
     @classmethod
@@ -69,7 +75,8 @@ class LoraConfig(peft.LoraConfig):
             self = LoraConfig(**self.to_dict())
 
         if os.path.isfile(os.path.join(pretrained_model_name_or_path, 'additional_config.json')):
-            with open(os.path.join(pretrained_model_name_or_path, 'additional_config.json'), 'r') as f:
+            with open(
+                    os.path.join(pretrained_model_name_or_path, 'additional_config.json'), 'r', encoding='utf-8') as f:
                 _json = json.load(f)
                 for key, value in _json.items():
                     setattr(self, key, value)
@@ -79,7 +86,7 @@ class LoraConfig(peft.LoraConfig):
 
 def _create_and_replace_hook(self, peft_config, adapter_name, target, *args, **kwargs):
     all_supported_names = ('linear', )
-    all_supported_types = (torch.nn.Embedding, torch.nn.Conv2d, transformers.pytorch_utils.Conv1D)
+    all_supported_types = (torch.nn.Embedding, torch.nn.Conv2d, transformers.pytorch_utils.Conv1D, lora.Linear)
     target_modules = getattr(peft_config, 'target_modules', None)
     if target is None:
         return
@@ -96,16 +103,8 @@ def _create_and_replace_hook(self, peft_config, adapter_name, target, *args, **k
 
 
 def _convert_dtype(target: torch.nn.Module, adapter_name: str, lora_dtype: str):
-    if lora_dtype == 'fp32':
-        torch_dtype = torch.float32
-    elif lora_dtype == 'fp16':
-        torch_dtype = torch.float16
-    elif lora_dtype == 'bf16':
-        torch_dtype = torch.bfloat16
-    else:
-        torch_dtype = None
-
-    if torch_dtype is not None:
+    if lora_dtype is not None:
+        torch_dtype = eval(f'torch.{lora_dtype}')
         if hasattr(target, 'lora_A') and adapter_name in target.lora_A:
             target.lora_A[adapter_name].to(torch_dtype)
             target.lora_B[adapter_name].to(torch_dtype)
@@ -288,14 +287,15 @@ def hot_patch_peft_module():
     VeraModel._create_and_replace = _create_and_replace_hook
     BOFTModel._create_and_replace_origin = BOFTModel._create_and_replace
     BOFTModel._create_and_replace = _create_and_replace_hook
-    IA3Model._create_and_replace_origin = IA3Model._create_and_replace
-    IA3Model._create_and_replace = _create_and_replace_hook
     if FourierFTModel is not None:
         FourierFTModel._create_and_replace_origin = FourierFTModel._create_and_replace
         FourierFTModel._create_and_replace = _create_and_replace_hook
+    if BoneModel is not None:
+        BoneModel._create_and_replace_origin = BoneModel._create_and_replace
+        BoneModel._create_and_replace = _create_and_replace_hook
 
     # Support type conversion
-    def init(self, model: torch.nn.Module, config: Dict[str, LoraConfig], adapter_name):
+    def __new_init__(self, model: torch.nn.Module, config: Dict[str, LoraConfig], adapter_name: str):
 
         self.__init_origin__(model, config, adapter_name)
         if isinstance(self.active_adapter, list):
@@ -311,7 +311,7 @@ def hot_patch_peft_module():
                             lora.forward = MethodType(keep_device_forward, lora)
 
     LoraModel.__init_origin__ = LoraModel.__init__
-    LoraModel.__init__ = init
+    LoraModel.__init__ = __new_init__
 
     # Support LoRA+
     PeftModel.create_optimizer_param_groups = create_optimizer_param_groups
@@ -352,6 +352,7 @@ def get_wrapped_class(module_class):
             return module_class.from_pretrained(model, model_id, *args, **kwargs)
 
     PeftWrapper.__name__ = module_class.__name__
+    PeftWrapper.__qualname__ = module_class.__qualname__
     return PeftWrapper
 
 
@@ -375,7 +376,6 @@ PrefixTuningConfig = wrap_module(PrefixTuningConfig)
 PromptLearningConfig = wrap_module(PromptLearningConfig)
 LoraConfig = wrap_module(LoraConfig)
 AdaLoraConfig = wrap_module(AdaLoraConfig)
-IA3Config = wrap_module(IA3Config)
 LoHaConfig = wrap_module(LoHaConfig)
 LoKrConfig = wrap_module(LoKrConfig)
 LoftQConfig = wrap_module(LoftQConfig)
